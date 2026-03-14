@@ -34,7 +34,7 @@ async function getOrCreatePersonalConv(userA, userB) {
   if (rows.length > 0) return rows[0].id;
 
   // Crear nueva conversacion personal
-  const client = await db.pool.connect();
+  const client = await db.getClient();
   try {
     await client.query('BEGIN');
     const { rows: conv } = await client.query(
@@ -216,6 +216,7 @@ router.get('/personal/:userId/messages', auth, async (req, res) => {
     const { rows } = await db.query(`
       SELECT
         m.id, m.texto, m.created_at,
+        m.conversation_id,
         u.id     AS sender_id,
         u.nombre AS sender_nombre,
         u.skin, u.border
