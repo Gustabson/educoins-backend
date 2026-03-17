@@ -166,4 +166,75 @@ router.patch('/:id/estado', auth, roles('admin'), async (req, res) => {
   }
 });
 
+// ── GET /reports/:id/messages ─────────────────────────────────
+// Historial de mensajes de un reporte (reporter o admin)
+router.get('/:id/messages', auth, async (req, res) => {
+  try {
+    // Verificar acceso: admin o el reporter
+    const { rows: rep } = await db.query(
+      'SELECT id, reporter_id FROM reports WHERE id = $1', [req.params.id]
+    );
+    if (rep.length === 0)
+      return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND', message: 'Reporte no encontrado' } });
+    if (req.user.rol !== 'admin' && rep[0].reporter_id !== req.user.id)
+      return res.status(403).json({ ok: false, error: { code: 'FORBIDDEN', message: 'Sin acceso' } });
+
+    const { rows } = await db.query(`
+      SELECT rm.id, rm.texto, rm.created_at,
+             u.id AS sender_id, u.nombre AS sender_nombre, u.rol AS sender_rol
+      FROM report_messages rm
+      JOIN users u ON u.id = rm.sender_id
+      WHERE rm.report_id = $1
+      ORDER BY rm.created_at ASC
+    `, [req.params.id]);
+
+    res.json({ ok: true, data: rows });
+  } catch (err) {
+    console.error('GET /reports/:id/messages error:', err);
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// ── POST /reports/:id/messages ────────────────────────────────
+// Enviar mensaje en un reporte (reporter o admin)
+router.post('/:id/messages', auth, async (req, res) => {
+  try {
+    const { texto } = req.body;
+    if (!texto?.trim())
+      return res.status(400).json({ ok: false, error: { code: 'EMPTY', message: 'El mensaje no puede estar vacío' } });
+
+    const { rows: rep } = await db.query(
+      'SELECT id, reporter_id, estado FROM reports WHERE id = $1', [req.params.id]
+    );
+    if (rep.length === 0)
+      return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND', message: 'Reporte no encontrado' } });
+    if (req.user.rol !== 'admin' && rep[0].reporter_id !== req.user.id)
+      return res.status(403).json({ ok: false, error: { code: 'FORBIDDEN', message: 'Sin acceso' } });
+
+    const { rows } = await db.query(`
+      INSERT INTO report_messages (report_id, sender_id, texto)
+      VALUES ($1, $2, $3)
+      RETURNING id, texto, created_at
+    `, [req.params.id, req.user.id, texto.trim()]);
+
+    // Si el admin responde, pasar a en_revision automáticamente
+    if (req.user.rol === 'admin' && rep[0].estado === 'recibido') {
+      await db.query(
+        "UPDATE reports SET estado = 'en_revision', updated_at = NOW() WHERE id = $1",
+        [req.params.id]
+      );
+    }
+
+    res.status(201).json({ ok: true, data: {
+      ...rows[0],
+      sender_id: req.user.id,
+      sender_nombre: req.user.nombre,
+      sender_rol: req.user.rol
+    }});
+  } catch (err) {
+    console.error('POST /reports/:id/messages error:', err);
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 module.exports = router;

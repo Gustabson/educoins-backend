@@ -89,23 +89,23 @@ router.get('/:id', auth, async (req, res) => {
 
 // ── POST /polls ───────────────────────────────────────────────
 // Admin o teacher crean una encuesta
-// Body: { titulo: string, opciones: string[], fin?: "YYYY-MM-DD" }
+// Body: { titulo: string, opciones: string[], fin?: ISO string }
 router.post('/', auth, roles('admin', 'teacher'), async (req, res) => {
-  const client = await db.pool.connect();
+  const client = await db.getClient();
   try {
     const { titulo, opciones, fin } = req.body;
 
-    if (!titulo || titulo.trim().length < 5) {
-      return res.status(400).json({ ok: false, error: { code: 'INVALID_TITULO', message: 'El título debe tener al menos 5 caracteres' } });
+    if (!titulo || titulo.trim().length < 3) {
+      return res.status(400).json({ ok: false, error: { code: 'INVALID_TITULO', message: 'El titulo debe tener al menos 3 caracteres' } });
     }
     if (!Array.isArray(opciones) || opciones.length < 2) {
       return res.status(400).json({ ok: false, error: { code: 'INVALID_OPTIONS', message: 'Debe haber al menos 2 opciones' } });
     }
     if (opciones.length > 8) {
-      return res.status(400).json({ ok: false, error: { code: 'TOO_MANY_OPTIONS', message: 'Máximo 8 opciones' } });
+      return res.status(400).json({ ok: false, error: { code: 'TOO_MANY_OPTIONS', message: 'Maximo 8 opciones' } });
     }
     if (opciones.some(o => !o || o.trim().length === 0)) {
-      return res.status(400).json({ ok: false, error: { code: 'EMPTY_OPTION', message: 'Ninguna opción puede estar vacía' } });
+      return res.status(400).json({ ok: false, error: { code: 'EMPTY_OPTION', message: 'Ninguna opcion puede estar vacia' } });
     }
 
     await client.query('BEGIN');
@@ -118,7 +118,6 @@ router.post('/', auth, roles('admin', 'teacher'), async (req, res) => {
 
     const pollId = poll[0].id;
 
-    // Insertar opciones en orden
     for (let i = 0; i < opciones.length; i++) {
       await client.query(
         'INSERT INTO poll_options (poll_id, texto, orden) VALUES ($1, $2, $3)',
@@ -133,7 +132,7 @@ router.post('/', auth, roles('admin', 'teacher'), async (req, res) => {
   } catch (err) {
     await client.query('ROLLBACK');
     console.error('POST /polls error:', err);
-    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: 'Error al crear votación' } });
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
   } finally {
     client.release();
   }
