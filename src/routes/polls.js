@@ -160,8 +160,13 @@ router.post('/:id/vote', auth, async (req, res) => {
     if (!poll[0].activa) {
       return res.status(400).json({ ok: false, error: { code: 'POLL_CLOSED', message: 'Esta votación ya está cerrada' } });
     }
-    if (poll[0].fin && new Date(poll[0].fin) < new Date()) {
-      return res.status(400).json({ ok: false, error: { code: 'POLL_EXPIRED', message: 'Esta votación ya venció' } });
+    if (poll[0].fin) {
+      // Comparar al final del día para no rechazar votos del mismo día
+      const finDate = new Date(poll[0].fin);
+      finDate.setHours(23, 59, 59, 999);
+      if (finDate < new Date()) {
+        return res.status(400).json({ ok: false, error: { code: 'POLL_EXPIRED', message: 'Esta votacion ya vencio' } });
+      }
     }
 
     // Verificar que la opción pertenezca a esta encuesta
