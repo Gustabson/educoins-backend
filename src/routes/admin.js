@@ -237,4 +237,105 @@ router.post('/classrooms/:id/members', auth, roles('admin'), async (req, res) =>
   }
 });
 
+// ── GET /admin/ranking ────────────────────────────────────────
+// Top holders (balance actual) y top ganadores por misiones
+router.get('/ranking', auth, roles('admin'), async (req, res) => {
+  try {
+    // Top holders = mayor balance actual (lo que tienen ahora)
+    const { rows: topHolders } = await db.query(`
+      SELECT u.id, u.nombre, u.skin, u.border, u.rol,
+        COALESCE(SUM(le.amount),0)::integer AS balance
+      FROM users u
+      JOIN accounts a ON a.user_id=u.id AND a.account_type IN ('student','teacher')
+      LEFT JOIN ledger_entries le ON le.account_id=a.id
+      WHERE u.activo=TRUE AND u.rol='student'
+      GROUP BY u.id ORDER BY balance DESC LIMIT 10
+    `);
+
+    // Top por misiones = suma de rewards recibidos por misiones aprobadas
+    const { rows: topMisiones } = await db.query(`
+      SELECT u.id, u.nombre, u.skin, u.border,
+        COALESCE(SUM(le.amount),0)::integer AS ganado_misiones,
+        COUNT(DISTINCT ms.id)::int AS misiones_completadas
+      FROM users u
+      JOIN mission_submissions ms ON ms.student_id=u.id AND ms.estado='aprobada'
+      JOIN transactions t ON t.id=ms.transaction_id AND t.type='reward'
+      JOIN accounts a ON a.user_id=u.id
+      JOIN ledger_entries le ON le.transaction_id=t.id AND le.account_id=a.id AND le.amount>0
+      WHERE u.activo=TRUE
+      GROUP BY u.id ORDER BY ganado_misiones DESC LIMIT 10
+    `);
+
+    // Top check-in racha
+    const { rows: topCheckin } = await db.query(`
+      SELECT u.id, u.nombre, u.skin, u.border,
+        dc.racha AS racha_max,
+        COUNT(dc.id)::int AS total_checkins
+      FROM users u
+      JOIN daily_checkins dc ON dc.user_id=u.id
+      WHERE u.activo=TRUE
+      GROUP BY u.id, dc.racha
+      ORDER BY racha_max DESC, total_checkins DESC LIMIT 10
+    `);
+
+    // Stats generales
+    const { rows: stats } = await db.query(`
+      SELECT
+        COUNT(DISTINCT CASE WHEN u.rol='student' AND u.activo THEN u.id END)::int AS total_alumnos,
+        COUNT(DISTINCT CASE WHEN ms.estado='aprobada' THEN ms.id END)::int AS total_misiones_completadas,
+        COUNT(DISTINCT dc.id)::int AS total_checkins,
+        COALESCE(SUM(CASE WHEN le.amount>0 AND t.type='reward' THEN le.amount ELSE 0 END),0)::integer AS total_distribuido
+      FROM users u
+      LEFT JOIN mission_submissions ms ON ms.student_id=u.id
+      LEFT JOIN daily_checkins dc ON dc.user_id=u.id
+      LEFT JOIN accounts a ON a.user_id=u.id
+      LEFT JOIN ledger_entries le ON le.account_id=a.id
+      LEFT JOIN transactions t ON t.id=le.transaction_id
+    `);
+
+    res.json({ ok: true, data: { topHolders, topMisiones, topCheckin, stats: stats[0] } });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// ── POST /admin/bank-transfer ─────────────────────────────────
+// Banco: el admin transfiere directamente desde la tesorería a un usuario
+// Body: { to_user_id, amount, descripcion, tipo: 'premio'|'prestamo'|'ajuste'|'salario' }
+router.post('/bank-transfer', auth, roles('admin'), async (req, res) => {
+  const client = await db.getClient();
+  try {
+    const { to_user_id, amount, descripcion, tipo='premio' } = req.body;
+    if (!to_user_id || !amount || amount<=0)
+      return res.status(400).json({ ok: false, error: { code: 'MISSING_FIELDS' } });
+
+    const ledger = require('../services/ledger');
+    // Usamos reward con el admin como teacher (tiene permisos)
+    const txId = await ledger.reward({
+      teacherId:   req.user.id,
+      studentId:   to_user_id,
+      amount:      parseInt(amount),
+      description: descripcion || `Transferencia bancaria (${tipo}) — Admin`,
+    });
+
+    // Notificar
+    try {
+      const { getIO } = require('../socket');
+      const io = getIO();
+      if (io) io.to(`user:${to_user_id}`).emit('notification', {
+        type: 'reward', amount: parseInt(amount),
+        description: descripcion || `Transferencia del banco (${tipo})`,
+        from: 'Banco Aubank',
+      });
+    } catch(e) {}
+
+    res.json({ ok: true, data: { transaction_id: txId } });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(()=>{});
+    res.status(err.code==='BUDGET_EXCEEDED'?422:500).json({
+      ok: false, error: { code: err.code||'SERVER_ERROR', message: err.message }
+    });
+  } finally { client.release(); }
+});
+
 module.exports = router;
