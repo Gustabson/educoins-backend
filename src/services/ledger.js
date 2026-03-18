@@ -8,6 +8,15 @@ const { v4: uuidv4 } = require('uuid');
 const { assertSufficientBalance, getTreasuryAccountId, getAccountByUserId } = require('./balance');
 const audit = require('./audit');
 
+// Importar io de socket para notificaciones en tiempo real
+function notifyUser(userId, payload) {
+  try {
+    const { getIO } = require('../socket');
+    const io = getIO();
+    if (io) io.to(`user:${userId}`).emit('notification', payload);
+  } catch(e) {}
+}
+
 /**
  * Crea una transacción de doble entrada en la base de datos.
  * Es la función base — todas las demás la usan internamente.
@@ -131,6 +140,8 @@ async function reward({ teacherId, studentId, amount, description, meta = {} }) 
 
     await audit.log({ actorId: teacherId, action: 'reward', targetType: 'user', targetId: studentId, details: { amount, description } }, client);
     await client.query('COMMIT');
+    // Notificar al alumno en tiempo real
+    notifyUser(studentId, { type: 'reward', amount, description, from: 'Docente' });
     return txId;
   } catch (err) {
     await client.query('ROLLBACK');
@@ -172,6 +183,8 @@ async function transfer({ fromUserId, toUserId, amount, description }) {
 
     await audit.log({ actorId: fromUserId, action: 'transfer', targetType: 'user', targetId: toUserId, details: { amount } }, client);
     await client.query('COMMIT');
+    // Notificar al receptor
+    notifyUser(toUserId, { type: 'transfer', amount, from_user_id: fromUserId });
     return txId;
   } catch (err) {
     await client.query('ROLLBACK');
