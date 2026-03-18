@@ -137,7 +137,7 @@ router.post('/', auth, async (req, res) => {
     // Guardar notificación persistente
     await client.query(`
       INSERT INTO notifications (user_id, tipo, titulo, cuerpo, data)
-      VALUES ($1,'checkin',$2,$3,$4)
+      VALUES ($1,'reward',$2,$3,$4)
     `, [req.user.id,
         `Check-in día ${racha}! +${recompensa} monedas`,
         bonus_tipo ? `Bonus de racha ${bonus_tipo} incluido!` : 'Seguí así todos los días',
