@@ -35,6 +35,8 @@ app.use('/api/v1/polls',        require('./routes/polls'));
 app.use('/api/v1/reports',      require('./routes/reports'));
 app.use('/api/v1/chat',         require('./routes/chat'));
 app.use('/api/v1/custom',       require('./routes/customization'));
+app.use('/api/v1/checkin',      require('./routes/checkin'));
+app.use('/api/v1/notifications',require('./routes/notifications'));
 
 // ── Health check ──────────────────────────────────────────────
 app.get('/health', (req, res) => {
