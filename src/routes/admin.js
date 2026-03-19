@@ -352,6 +352,15 @@ router.post('/bank-transfer', auth, roles('admin'), async (req, res) => {
           amount: parseInt(amount),
           description: descripcion || `${tipo} bancario — Admin`,
         });
+        // Guardar en audit_log con el transaction_id visible
+        await db.query(`
+          INSERT INTO audit_log (actor_id, action, target_type, target_id, details)
+          VALUES ($1,'reward','user',$2,$3)
+          ON CONFLICT DO NOTHING
+        `, [req.user.id, uid, JSON.stringify({
+          amount: parseInt(amount), tipo, descripcion,
+          transaction_id: txId, banco: true,
+        })]);
         results.push({ user_id: uid, tx_id: txId, ok: true });
         if (io) io.to(`user:${uid}`).emit('notification', {
           type: 'reward', amount: parseInt(amount),
