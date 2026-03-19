@@ -224,11 +224,12 @@ async function purchase({ studentId, itemId }) {
 
     // Buscar cuenta del alumno y de la tienda
     const studentAccId = await getAccountByUserId(studentId, client);
+    // Las compras van a la Tesorería — el tesoro recauda las ventas
     const storeResult  = await client.query(
-      "SELECT id FROM accounts WHERE account_type = 'store' AND is_active = true LIMIT 1"
+      "SELECT id FROM accounts WHERE account_type = 'treasury' AND is_active = true LIMIT 1"
     );
     const storeAccId = storeResult.rows[0]?.id;
-    if (!storeAccId) throw new Error('Cuenta de tienda no configurada');
+    if (!storeAccId) throw new Error('Cuenta de tesoreria no configurada');
 
     await assertSufficientBalance(studentAccId, item.precio, client);
 

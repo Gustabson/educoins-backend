@@ -30,11 +30,42 @@ router.post('/equip', auth, roles('student'), async (req, res) => {
 router.get('/ranking', auth, async (req, res) => {
   try {
     const { rows } = await db.query(
-      `SELECT id, nombre, total_earned, skin, border, title
+      `SELECT id, nombre, apodo, total_earned, skin, border, title
        FROM users WHERE rol='student' AND activo=true
        ORDER BY total_earned DESC LIMIT 20`
     );
     res.json({ ok: true, data: rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// PATCH /profile/apodo — cambiar apodo (requiere haberlo comprado)
+router.patch('/apodo', auth, async (req, res) => {
+  try {
+    const { apodo } = req.body;
+    // null = borrar apodo, string = setear
+    if (apodo !== null && apodo !== undefined) {
+      const clean = apodo.trim();
+      if (clean.length < 2 || clean.length > 30)
+        return res.status(400).json({ ok: false, error: { code: 'INVALID_APODO', message: 'El apodo debe tener entre 2 y 30 caracteres' } });
+
+      // Verificar que haya comprado el "Cambio de Apodo" en la tienda personalización
+      const { rows: perm } = await db.query(`
+        SELECT 1 FROM user_custom_items uci
+        JOIN shop_items_custom s ON s.id = uci.item_id
+        WHERE uci.user_id = $1 AND s.tipo = 'nickname'
+      `, [req.user.id]);
+      if (!perm.length) {
+        return res.status(403).json({ ok: false, error: { code: 'NOT_UNLOCKED', message: 'Necesitas comprar el item Cambio de Apodo primero' } });
+      }
+
+      await db.query('UPDATE users SET apodo=$1 WHERE id=$2', [clean, req.user.id]);
+    } else {
+      await db.query('UPDATE users SET apodo=NULL WHERE id=$1', [req.user.id]);
+    }
+    const { rows } = await db.query('SELECT apodo FROM users WHERE id=$1', [req.user.id]);
+    res.json({ ok: true, data: { apodo: rows[0].apodo } });
   } catch (err) {
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }
