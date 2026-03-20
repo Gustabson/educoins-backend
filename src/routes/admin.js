@@ -350,23 +350,17 @@ router.post('/bank-transfer', auth, roles('admin'), async (req, res) => {
         const txId = await ledger.reward({
           teacherId: req.user.id, studentId: uid,
           amount: parseInt(amount),
-          description: descripcion || `${tipo} bancario — Admin`,
+          description: descripcion || `${tipo} del Banco Aubank`,
         });
         // Guardar en audit_log con el transaction_id visible
         await db.query(`
           INSERT INTO audit_log (actor_id, action, target_type, target_id, details)
           VALUES ($1,'reward','user',$2,$3)
-          ON CONFLICT DO NOTHING
         `, [req.user.id, uid, JSON.stringify({
           amount: parseInt(amount), tipo, descripcion,
           transaction_id: txId, banco: true,
         })]);
         results.push({ user_id: uid, tx_id: txId, ok: true });
-        if (io) io.to(`user:${uid}`).emit('notification', {
-          type: 'reward', amount: parseInt(amount),
-          description: descripcion || `${tipo} del Banco Aubank`,
-          from: 'Banco Aubank',
-        });
       } catch(e) {
         results.push({ user_id: uid, ok: false, error: e.message });
       }
