@@ -160,7 +160,7 @@ router.post('/buy', auth, async (req, res) => {
 router.post('/equip', auth, async (req, res) => {
   try {
     const { tipo, item_id } = req.body;
-    const VALID_TIPOS = ['theme','name_color','emoji_pack','title_effect','name_effect','avatar_frame'];
+    const VALID_TIPOS = ['theme','name_color','emoji_pack','title_effect','name_effect','avatar_frame','screen_mode'];
     if (!VALID_TIPOS.includes(tipo)) return res.status(400).json({ ok: false, error: { code: 'INVALID_TIPO' } });
 
     // Si se quiere equipar (no desequipar), verificar que lo tiene
