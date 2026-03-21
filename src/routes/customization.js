@@ -49,9 +49,18 @@ router.get('/me', auth, async (req, res) => {
       ORDER BY uci.purchased_at DESC
     `, [req.user.id]);
 
-    const { rows: active } = await db.query(
-      'SELECT * FROM user_custom_active WHERE user_id = $1', [req.user.id]
-    );
+    // Incluir configs de items activos para que el frontend pueda aplicarlos
+    const { rows: active } = await db.query(`
+      SELECT uca.*,
+        t.config  AS theme_config,
+        nc.config AS name_color_config,
+        ep.config AS emoji_pack_config
+      FROM user_custom_active uca
+      LEFT JOIN shop_items_custom t  ON t.id  = uca.theme_id
+      LEFT JOIN shop_items_custom nc ON nc.id = uca.name_color_id
+      LEFT JOIN shop_items_custom ep ON ep.id = uca.emoji_pack_id
+      WHERE uca.user_id = $1
+    `, [req.user.id]);
 
     res.json({ ok: true, data: { owned, active: active[0] || null } });
   } catch (err) {
