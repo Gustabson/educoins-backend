@@ -26,6 +26,8 @@ router.get('/shop', auth, async (req, res) => {
     const { rows } = await db.query(`
       SELECT s.id, s.tipo, s.nombre, s.descripcion, s.precio, s.config,
              s.preview, s.orden,
+             s.es_suscripcion, s.periodo_default,
+             s.precio_semanal, s.precio_mensual, s.precio_anual,
              (SELECT 1 FROM user_custom_items WHERE user_id=$1 AND item_id=s.id) IS NOT NULL AS owned
       FROM shop_items_custom s
       WHERE s.activo = TRUE
@@ -347,16 +349,22 @@ router.post('/admin/items', auth, roles('admin'), async (req, res) => {
 // ── ADMIN: PATCH /custom/admin/items/:id ─────────────────────
 router.patch('/admin/items/:id', auth, roles('admin'), async (req, res) => {
   try {
-    const { precio, activo, nombre, descripcion, config, preview } = req.body;
+    const { precio, activo, nombre, descripcion, config, preview,
+            es_suscripcion, periodo_default, precio_semanal, precio_mensual, precio_anual } = req.body;
     const updates = [];
     const vals = [];
     let i = 1;
-    if (precio !== undefined) { updates.push(`precio=$${i++}`); vals.push(precio); }
-    if (activo !== undefined) { updates.push(`activo=$${i++}`); vals.push(activo); }
-    if (nombre)               { updates.push(`nombre=$${i++}`); vals.push(nombre); }
-    if (descripcion !== undefined) { updates.push(`descripcion=$${i++}`); vals.push(descripcion); }
-    if (config)               { updates.push(`config=$${i++}`); vals.push(config); }
-    if (preview !== undefined){ updates.push(`preview=$${i++}`); vals.push(preview); }
+    if (precio !== undefined)          { updates.push(`precio=$${i++}`);           vals.push(precio); }
+    if (activo !== undefined)          { updates.push(`activo=$${i++}`);           vals.push(activo); }
+    if (nombre)                        { updates.push(`nombre=$${i++}`);           vals.push(nombre); }
+    if (descripcion !== undefined)     { updates.push(`descripcion=$${i++}`);      vals.push(descripcion); }
+    if (config)                        { updates.push(`config=$${i++}`);           vals.push(config); }
+    if (preview !== undefined)         { updates.push(`preview=$${i++}`);          vals.push(preview); }
+    if (es_suscripcion !== undefined)  { updates.push(`es_suscripcion=$${i++}`);   vals.push(es_suscripcion); }
+    if (periodo_default !== undefined) { updates.push(`periodo_default=$${i++}`);  vals.push(periodo_default); }
+    if (precio_semanal !== undefined)  { updates.push(`precio_semanal=$${i++}`);   vals.push(precio_semanal); }
+    if (precio_mensual !== undefined)  { updates.push(`precio_mensual=$${i++}`);   vals.push(precio_mensual); }
+    if (precio_anual !== undefined)    { updates.push(`precio_anual=$${i++}`);     vals.push(precio_anual); }
     if (!updates.length) return res.status(400).json({ ok: false, error: { code: 'NOTHING_TO_UPDATE' } });
     vals.push(req.params.id);
     const { rows } = await db.query(
