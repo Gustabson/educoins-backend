@@ -54,11 +54,13 @@ router.get('/me', auth, async (req, res) => {
       SELECT uca.*,
         t.config  AS theme_config,
         nc.config AS name_color_config,
-        ep.config AS emoji_pack_config
+        ep.config AS emoji_pack_config,
+        sm.config AS screen_mode_config
       FROM user_custom_active uca
       LEFT JOIN shop_items_custom t  ON t.id  = uca.theme_id
       LEFT JOIN shop_items_custom nc ON nc.id = uca.name_color_id
       LEFT JOIN shop_items_custom ep ON ep.id = uca.emoji_pack_id
+      LEFT JOIN shop_items_custom sm ON sm.id = uca.screen_mode_id
       WHERE uca.user_id = $1
     `, [req.user.id]);
 
@@ -192,7 +194,8 @@ router.post('/equip', auth, async (req, res) => {
         ep.config AS emoji_pack_config, ep.nombre AS emoji_pack_nombre,
         te.config AS title_effect_config,
         ne.config AS name_effect_config,
-        af.config AS avatar_frame_config
+        af.config AS avatar_frame_config,
+        sm.config AS screen_mode_config, sm.nombre AS screen_mode_nombre
       FROM user_custom_active uca
       LEFT JOIN shop_items_custom t  ON t.id  = uca.theme_id
       LEFT JOIN shop_items_custom nc ON nc.id = uca.name_color_id
@@ -200,6 +203,7 @@ router.post('/equip', auth, async (req, res) => {
       LEFT JOIN shop_items_custom te ON te.id = uca.title_effect_id
       LEFT JOIN shop_items_custom ne ON ne.id = uca.name_effect_id
       LEFT JOIN shop_items_custom af ON af.id = uca.avatar_frame_id
+      LEFT JOIN shop_items_custom sm ON sm.id = uca.screen_mode_id
       WHERE uca.user_id = $1
     `, [req.user.id]);
 
