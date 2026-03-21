@@ -514,4 +514,35 @@ router.post('/tax', auth, roles('admin'), async (req, res) => {
   } finally { client.release(); }
 });
 
+// ── GET /admin/economy ────────────────────────────────────────
+router.get('/economy', auth, roles('admin'), async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      'SELECT * FROM economy_config ORDER BY categoria, item_key');
+    res.json({ ok: true, data: rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// ── PATCH /admin/economy/:id ──────────────────────────────────
+router.patch('/economy/:id', auth, roles('admin'), async (req, res) => {
+  try {
+    const { precio, activo, descripcion } = req.body;
+    const { rows } = await db.query(`
+      UPDATE economy_config SET
+        precio      = COALESCE($1, precio),
+        activo      = COALESCE($2, activo),
+        descripcion = COALESCE($3, descripcion),
+        updated_at  = NOW()
+      WHERE id=$4 RETURNING *
+    `, [precio, activo, descripcion, req.params.id]);
+    if (!rows.length)
+      return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND' } });
+    res.json({ ok: true, data: rows[0] });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 module.exports = router;
