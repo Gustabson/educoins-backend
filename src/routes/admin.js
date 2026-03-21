@@ -352,7 +352,7 @@ router.post('/bank-transfer', auth, roles('admin'), async (req, res) => {
           amount: parseInt(amount),
           description: descripcion || `${tipo} del Banco Aubank`,
         });
-        // Guardar en audit_log con el transaction_id visible
+        // Guardar en audit_log
         await db.query(`
           INSERT INTO audit_log (actor_id, action, target_type, target_id, details)
           VALUES ($1,'reward','user',$2,$3)
@@ -360,6 +360,15 @@ router.post('/bank-transfer', auth, roles('admin'), async (req, res) => {
           amount: parseInt(amount), tipo, descripcion,
           transaction_id: txId, banco: true,
         })]);
+        // Guardar notificación persistente en DB
+        await db.query(`
+          INSERT INTO notifications (user_id, tipo, titulo, cuerpo, data)
+          VALUES ($1, 'reward', $2, $3, $4)
+        `, [uid,
+          `Recibiste 🪙${parseInt(amount)} del Banco`,
+          descripcion || `${tipo} — Banco Aubank`,
+          JSON.stringify({ amount: parseInt(amount), tipo, transaction_id: txId })
+        ]);
         results.push({ user_id: uid, tx_id: txId, ok: true });
       } catch(e) {
         results.push({ user_id: uid, ok: false, error: e.message });

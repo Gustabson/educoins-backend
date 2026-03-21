@@ -86,7 +86,8 @@ router.get('/global/messages', auth, async (req, res) => {
         m.id, m.texto, m.created_at,
         m.conversation_id,
         u.id        AS sender_id,
-        u.nombre    AS sender_nombre,
+        COALESCE(u.apodo, u.nombre) AS sender_nombre,
+        u.apodo AS sender_apodo,
         u.rol       AS sender_rol,
         u.skin, u.border
       FROM messages m
@@ -168,7 +169,8 @@ router.get('/classroom/messages', auth, async (req, res) => {
         m.id, m.texto, m.created_at,
         m.conversation_id,
         u.id     AS sender_id,
-        u.nombre AS sender_nombre,
+        COALESCE(u.apodo, u.nombre) AS sender_nombre,
+        u.apodo AS sender_apodo,
         u.rol    AS sender_rol,
         u.skin, u.border
       FROM messages m
@@ -218,7 +220,8 @@ router.get('/personal/:userId/messages', auth, async (req, res) => {
         m.id, m.texto, m.created_at,
         m.conversation_id,
         u.id     AS sender_id,
-        u.nombre AS sender_nombre,
+        COALESCE(u.apodo, u.nombre) AS sender_nombre,
+        u.apodo AS sender_apodo,
         u.skin, u.border
       FROM messages m
       LEFT JOIN users u ON u.id = m.sender_id
