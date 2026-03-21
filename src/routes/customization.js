@@ -49,7 +49,6 @@ router.get('/me', auth, async (req, res) => {
       ORDER BY uci.purchased_at DESC
     `, [req.user.id]);
 
-    // Incluir configs de items activos para que el frontend pueda aplicarlos
     const { rows: active } = await db.query(`
       SELECT uca.*,
         t.config  AS theme_config,
@@ -161,18 +160,16 @@ router.post('/buy', auth, async (req, res) => {
 // Body: { tipo: 'theme'|'name_color'|..., item_id: UUID|null }
 router.post('/equip', auth, async (req, res) => {
   try {
-    const { tipo, item_id } = req.body;
+    const { tipo, item_id, custom_bg_color, custom_accent_color } = req.body;
     const VALID_TIPOS = ['theme','name_color','emoji_pack','title_effect','name_effect','avatar_frame','screen_mode'];
     if (!VALID_TIPOS.includes(tipo)) return res.status(400).json({ ok: false, error: { code: 'INVALID_TIPO' } });
 
-    // Si se quiere equipar (no desequipar), verificar que lo tiene
     if (item_id) {
       const { rows } = await db.query(
         'SELECT 1 FROM user_custom_items WHERE user_id=$1 AND item_id=$2', [req.user.id, item_id]
       );
-      // Items gratis (precio=0) se pueden equipar sin comprar
       const { rows: item } = await db.query(
-        'SELECT precio FROM shop_items_custom WHERE id=$1', [item_id]
+        'SELECT precio, config FROM shop_items_custom WHERE id=$1', [item_id]
       );
       if (!rows.length && item[0]?.precio > 0) {
         return res.status(403).json({ ok: false, error: { code: 'NOT_OWNED', message: 'No tenés este item' } });
@@ -180,10 +177,15 @@ router.post('/equip', auth, async (req, res) => {
     }
 
     const col = `${tipo}_id`;
+    // Para screen_mode custom, guardar también los colores elegidos
+    const extraCols = (tipo === 'screen_mode' && custom_bg_color)
+      ? `, custom_bg_color='${custom_bg_color}', custom_accent_color='${custom_accent_color||custom_bg_color}'`
+      : '';
+
     await db.query(`
       INSERT INTO user_custom_active (user_id, ${col}, updated_at)
       VALUES ($1, $2, NOW())
-      ON CONFLICT (user_id) DO UPDATE SET ${col}=$2, updated_at=NOW()
+      ON CONFLICT (user_id) DO UPDATE SET ${col}=$2${extraCols}, updated_at=NOW()
     `, [req.user.id, item_id || null]);
 
     // Devolver activos completos con configs
