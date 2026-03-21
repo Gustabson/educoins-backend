@@ -120,17 +120,20 @@ router.get('/user/:id', auth, async (req, res) => {
       SELECT u.id, u.nombre, u.apodo, u.titulo_custom, u.skin, u.border, u.title,
              u.foto_url, u.total_earned, u.rol,
              COALESCE(SUM(le.amount),0)::integer AS balance,
-             (SELECT COUNT(*)::int FROM mission_submissions ms WHERE ms.student_id=u.id AND ms.estado='aprobada') AS misiones,
+             (SELECT COUNT(*)::int FROM mission_submissions ms
+              WHERE ms.student_id=u.id AND ms.estado='aprobada') AS misiones,
              (SELECT COUNT(*)::int FROM daily_checkins dc WHERE dc.user_id=u.id) AS checkins,
-             (SELECT racha FROM daily_checkins dc WHERE dc.user_id=u.id ORDER BY fecha DESC LIMIT 1) AS racha
+             (SELECT COALESCE(MAX(racha),0) FROM daily_checkins dc WHERE dc.user_id=u.id) AS racha
       FROM users u
       LEFT JOIN accounts a ON a.user_id=u.id AND a.account_type IN ('student','teacher')
       LEFT JOIN ledger_entries le ON le.account_id=a.id
-      WHERE u.id=$1 AND u.activo=TRUE GROUP BY u.id
+      WHERE u.id=$1 AND u.activo=TRUE
+      GROUP BY u.id
     `, [req.params.id]);
     if (!rows.length) return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND' } });
     res.json({ ok: true, data: rows[0] });
   } catch (err) {
+    console.error('publicProfile error:', err.message);
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }
 });
