@@ -118,7 +118,7 @@ router.get('/user/:id', auth, async (req, res) => {
   try {
     const { rows } = await db.query(`
       SELECT u.id, u.nombre, u.apodo, u.titulo_custom, u.skin, u.border, u.title,
-             u.foto_url, u.total_earned, u.rol,
+             u.foto_url, u.total_earned, u.rol, u.estado, u.active_titles,
              COALESCE(SUM(le.amount),0)::integer AS balance,
              (SELECT COUNT(*)::int FROM mission_submissions ms
               WHERE ms.student_id=u.id AND ms.estado='aprobada') AS misiones,
@@ -295,6 +295,59 @@ router.patch('/estado', auth, async (req, res) => {
     const val = estado?.trim().slice(0,40)||null;
     await db.query('UPDATE users SET estado=$1 WHERE id=$2', [val, req.user.id]);
     res.json({ ok:true, data:{ estado: val } });
+  } catch(err) {
+    res.status(500).json({ ok:false, error:{code:'SERVER_ERROR', message:err.message} });
+  }
+});
+
+// ── PATCH /profile/active-titles ─────────────────────────────
+// Actualiza los títulos activos del alumno (máximo 3)
+// Body: { titles: ["tl2", "custom:Ninja 🥷", ...] }
+router.patch('/active-titles', auth, roles('student'), async (req, res) => {
+  try {
+    const { titles } = req.body;
+    if (!Array.isArray(titles)) return res.status(400).json({ ok:false, error:{code:'INVALID'} });
+    if (titles.length > 3) return res.status(400).json({ ok:false, error:{code:'TOO_MANY', message:'Máximo 3 títulos'} });
+
+    // Validate: each title is either a known system id or "custom:text"
+    const VALID_IDS = ['tl1','tl2','tl3','tl4','tl5'];
+    for(const t of titles){
+      if(!t) continue;
+      if(t.startsWith('custom:')){
+        const text = t.slice(7);
+        if(text.length > 30) return res.status(400).json({ ok:false, error:{code:'TITLE_TOO_LONG'} });
+      } else if(!VALID_IDS.includes(t)){
+        return res.status(400).json({ ok:false, error:{code:'INVALID_TITLE_ID', message: `ID inválido: ${t}`} });
+      }
+    }
+
+    // If any custom titles, verify user has bought title_custom permission
+    const hasCustom = titles.some(t=>t.startsWith('custom:'));
+    if(hasCustom){
+      const { rows: perm } = await db.query(
+        `SELECT uci.id FROM user_custom_items uci
+         JOIN shop_items_custom s ON s.id=uci.item_id
+         WHERE uci.user_id=$1 AND s.tipo='title_custom'`,
+        [req.user.id]
+      );
+      // Also check if they have an active subscription for title_custom
+      const { rows: sub } = await db.query(
+        `SELECT us.id FROM user_subscriptions us
+         JOIN shop_items_custom s ON s.id=us.item_id
+         WHERE us.user_id=$1 AND s.tipo='title_custom' AND us.activa=true`,
+        [req.user.id]
+      );
+      if(!perm.length && !sub.length){
+        return res.status(403).json({ ok:false, error:{code:'NOT_OWNED', message:'Comprá el permiso de título personalizado primero'} });
+      }
+    }
+
+    await db.query(
+      'UPDATE users SET active_titles=$1 WHERE id=$2',
+      [JSON.stringify(titles), req.user.id]
+    );
+
+    res.json({ ok:true, data:{ active_titles: titles } });
   } catch(err) {
     res.status(500).json({ ok:false, error:{code:'SERVER_ERROR', message:err.message} });
   }
