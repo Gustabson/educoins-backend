@@ -184,7 +184,6 @@ router.post('/buy-item', auth, roles('student'), async (req, res) => {
   const VALID = ['skin','border','title'];
   if (!VALID.includes(type)) return res.status(400).json({ ok:false, error:{code:'INVALID_TYPE'} });
 
-  // Precios hardcodeados — deben coincidir con SKINS/TITLES/BORDERS en constants.js
   const PRICES = {
     skin:   { s1:0, s2:150, s3:200, s4:250, s5:300, s6:350, s7:400, s8:500 },
     border: { b1:0, b2:100, b3:150, b4:200, b5:300 },
@@ -194,41 +193,48 @@ router.post('/buy-item', auth, roles('student'), async (req, res) => {
   const precio = PRICES[type]?.[item_id];
   if (precio === undefined) return res.status(400).json({ ok:false, error:{code:'ITEM_NOT_FOUND'} });
 
-  const client = await db.pool.connect();
+  const { getTreasuryAccountId, getBalance } = require('../services/balance');
+  const { v4: uuidv4 } = require('uuid');
+  const arrCol = { skin:'unlocked_skins', border:'unlocked_borders', title:'unlocked_titles' }[type];
+
+  const client = await db.getClient();
   try {
     await client.query('BEGIN');
 
-    // Verificar que no lo tenga ya
-    const arrCol = { skin:'unlocked_skins', border:'unlocked_borders', title:'unlocked_titles' }[type];
-    const { rows } = await client.query(`SELECT ${arrCol}, account_id FROM users u JOIN accounts a ON a.user_id=u.id AND a.account_type='student' WHERE u.id=$1`, [req.user.id]);
+    const { rows } = await client.query(
+      `SELECT u.${arrCol}, a.id as account_id FROM users u
+       JOIN accounts a ON a.user_id=u.id AND a.account_type='student'
+       WHERE u.id=$1`, [req.user.id]);
     if (!rows.length) throw new Error('Usuario no encontrado');
     if (rows[0][arrCol].includes(item_id)) {
       await client.query('ROLLBACK');
       return res.status(422).json({ ok:false, error:{code:'ALREADY_OWNED', message:'Ya tenés este ítem'} });
     }
 
-    // Cobrar si tiene precio
     if (precio > 0) {
-      const { ledger } = require('../services/ledger');
-      const { getBalance, getTreasuryAccountId } = require('../services/balance');
       const balance = await getBalance(rows[0].account_id);
       if (balance < precio) {
         await client.query('ROLLBACK');
         return res.status(422).json({ ok:false, error:{code:'INSUFFICIENT_BALANCE', message:'Saldo insuficiente'} });
       }
       const treasuryId = await getTreasuryAccountId(client);
-      // Doble entrada: -precio del alumno, +precio a tesorería
-      const txId = require('uuid').v4();
-      await client.query(`INSERT INTO transactions (id,type,description,initiated_by) VALUES ($1,'purchase','Compra de ${type}: ${item_id}',$2)`, [txId, req.user.id]);
-      await client.query(`INSERT INTO ledger_entries (transaction_id,account_id,amount) VALUES ($1,$2,$3),($1,$4,$5)`,
+      const txId = uuidv4();
+      await client.query(
+        `INSERT INTO transactions (id,type,description,initiated_by) VALUES ($1,'purchase',$2,$3)`,
+        [txId, `Compra de ${type}: ${item_id}`, req.user.id]);
+      await client.query(
+        `INSERT INTO ledger_entries (transaction_id,account_id,amount) VALUES ($1,$2,$3),($1,$4,$5)`,
         [txId, rows[0].account_id, -precio, treasuryId, precio]);
     }
 
-    // Agregar al array de desbloqueados
-    await client.query(`UPDATE users SET ${arrCol} = array_append(${arrCol}, $1) WHERE id=$2`, [item_id, req.user.id]);
+    await client.query(
+      `UPDATE users SET ${arrCol} = array_append(${arrCol}, $1) WHERE id=$2`,
+      [item_id, req.user.id]);
 
     await client.query('COMMIT');
-    const { rows: updated } = await db.query(`SELECT unlocked_skins, unlocked_borders, unlocked_titles, skin, border, title FROM users WHERE id=$1`, [req.user.id]);
+    const { rows: updated } = await db.query(
+      `SELECT unlocked_skins, unlocked_borders, unlocked_titles, skin, border, title FROM users WHERE id=$1`,
+      [req.user.id]);
     res.json({ ok:true, data: updated[0] });
   } catch(err) {
     await client.query('ROLLBACK');
@@ -240,28 +246,34 @@ router.post('/buy-item', auth, roles('student'), async (req, res) => {
 // Cobra cada vez que el alumno cambia el título personalizado
 // Body: { titulo: string }
 router.post('/buy-titulo-change', auth, roles('student'), async (req, res) => {
+  const { titulo, precio } = req.body;
+  if (!titulo?.trim()) return res.status(400).json({ ok:false, error:{code:'INVALID_TITULO'} });
+  if (titulo.trim().length > 30) return res.status(400).json({ ok:false, error:{code:'TOO_LONG'} });
+
+  const { getTreasuryAccountId, getBalance } = require('../services/balance');
+  const { v4: uuidv4 } = require('uuid');
+  const precioFinal = precio || 0;
+
   try {
-    const { titulo, precio } = req.body;
-    if (!titulo?.trim()) return res.status(400).json({ ok:false, error:{code:'INVALID_TITULO'} });
-    if (titulo.trim().length > 20) return res.status(400).json({ ok:false, error:{code:'TOO_LONG'} });
-
-    const precioFinal = precio || 0;
-
     if (precioFinal > 0) {
-      const { rows } = await db.query(`SELECT a.id as account_id FROM accounts a WHERE a.user_id=$1 AND a.account_type='student'`, [req.user.id]);
+      const { rows } = await db.query(
+        `SELECT a.id as account_id FROM accounts a WHERE a.user_id=$1 AND a.account_type='student'`,
+        [req.user.id]);
       if (!rows.length) return res.status(404).json({ ok:false, error:{code:'ACCOUNT_NOT_FOUND'} });
-      const { getBalance } = require('../services/balance');
+
       const balance = await getBalance(rows[0].account_id);
       if (balance < precioFinal) return res.status(422).json({ ok:false, error:{code:'INSUFFICIENT_BALANCE', message:'Saldo insuficiente'} });
 
-      const client = await db.pool.connect();
+      const client = await db.getClient();
       try {
         await client.query('BEGIN');
-        const { getTreasuryAccountId } = require('../services/balance');
         const treasuryId = await getTreasuryAccountId(client);
-        const txId = require('uuid').v4();
-        await client.query(`INSERT INTO transactions (id,type,description,initiated_by) VALUES ($1,'purchase','Cambio de título personalizado',$2)`, [txId, req.user.id]);
-        await client.query(`INSERT INTO ledger_entries (transaction_id,account_id,amount) VALUES ($1,$2,$3),($1,$4,$5)`,
+        const txId = uuidv4();
+        await client.query(
+          `INSERT INTO transactions (id,type,description,initiated_by) VALUES ($1,'purchase','Cambio de título personalizado',$2)`,
+          [txId, req.user.id]);
+        await client.query(
+          `INSERT INTO ledger_entries (transaction_id,account_id,amount) VALUES ($1,$2,$3),($1,$4,$5)`,
           [txId, rows[0].account_id, -precioFinal, treasuryId, precioFinal]);
         await client.query('UPDATE users SET titulo_custom=$1 WHERE id=$2', [titulo.trim(), req.user.id]);
         await client.query('COMMIT');
@@ -270,7 +282,6 @@ router.post('/buy-titulo-change', auth, roles('student'), async (req, res) => {
     } else {
       await db.query('UPDATE users SET titulo_custom=$1 WHERE id=$2', [titulo.trim(), req.user.id]);
     }
-
     res.json({ ok:true, data:{ titulo_custom: titulo.trim() } });
   } catch(err) {
     res.status(500).json({ ok:false, error:{code:'SERVER_ERROR', message:err.message} });
