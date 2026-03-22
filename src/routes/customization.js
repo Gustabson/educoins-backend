@@ -204,7 +204,8 @@ router.post('/equip', auth, async (req, res) => {
         ne.config AS name_effect_config,
         af.config AS avatar_frame_config,
         sm.config AS screen_mode_config, sm.nombre AS screen_mode_nombre,
-        ts.config AS text_style_config,  ts.nombre AS text_style_nombre
+        ts.config AS text_style_config,  ts.nombre AS text_style_nombre,
+        uca.custom_mode_config
       FROM user_custom_active uca
       LEFT JOIN shop_items_custom t  ON t.id  = uca.theme_id
       LEFT JOIN shop_items_custom nc ON nc.id = uca.name_color_id
@@ -377,3 +378,25 @@ router.patch('/admin/items/:id', auth, roles('admin'), async (req, res) => {
 });
 
 module.exports = router;
+
+// ── POST /custom/save-mode ────────────────────────────────────
+// Guarda el modo de pantalla personalizado del alumno
+// Body: { config: { bg, card, nav, inputBg, isDark, ... } }
+router.post('/save-mode', auth, async (req, res) => {
+  try {
+    const { config } = req.body;
+    if (!config || typeof config !== 'object') {
+      return res.status(400).json({ ok: false, error: { code: 'INVALID_CONFIG' } });
+    }
+    // Guardar en user_custom_active.custom_mode_config (JSON)
+    await db.query(`
+      INSERT INTO user_custom_active (user_id, custom_mode_config, updated_at)
+      VALUES ($1, $2, NOW())
+      ON CONFLICT (user_id) DO UPDATE SET custom_mode_config=$2, updated_at=NOW()
+    `, [req.user.id, JSON.stringify(config)]);
+
+    res.json({ ok: true, data: { saved: true } });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
