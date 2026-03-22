@@ -93,7 +93,7 @@ router.get('/me', auth, async (req, res) => {
   try {
     const { rows } = await db.query(
       `SELECT id, email, nombre, apodo, alias, rol, skin, border, title,
-              unlocked_skins, unlocked_borders, unlocked_titles, total_earned
+              unlocked_skins, unlocked_borders, unlocked_titles, total_earned, estado
        FROM users WHERE id = $1`,
       [req.user.id]
     );
