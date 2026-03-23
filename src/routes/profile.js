@@ -40,34 +40,73 @@ router.get('/ranking', auth, async (req, res) => {
   }
 });
 
-// PATCH /profile/apodo
+// PATCH /profile/apodo — cobra monedas por cambio (precio configurable en shop_items_custom tipo 'nickname')
 router.patch('/apodo', auth, async (req, res) => {
+  const { apodo } = req.body;
+  const { getTreasuryAccountId, getBalance } = require('../services/balance');
+  const { v4: uuidv4 } = require('uuid');
   try {
-    const { apodo } = req.body;
-    // null = borrar apodo, string = setear
     if (apodo !== null && apodo !== undefined) {
       const clean = apodo.trim();
       if (clean.length < 2 || clean.length > 30)
-        return res.status(400).json({ ok: false, error: { code: 'INVALID_APODO', message: 'El apodo debe tener entre 2 y 30 caracteres' } });
+        return res.status(400).json({ ok:false, error:{code:'INVALID_APODO',message:'Entre 2 y 30 caracteres'} });
 
-      // Verificar que haya comprado el "Cambio de Apodo" en la tienda personalización
-      const { rows: perm } = await db.query(`
-        SELECT 1 FROM user_custom_items uci
-        JOIN shop_items_custom s ON s.id = uci.item_id
-        WHERE uci.user_id = $1 AND s.tipo = 'nickname'
-      `, [req.user.id]);
-      if (!perm.length) {
-        return res.status(403).json({ ok: false, error: { code: 'NOT_UNLOCKED', message: 'Necesitas comprar el item Cambio de Apodo primero' } });
+      // Buscar item de nickname y verificar permiso (compra o suscripción activa)
+      const { rows: items } = await db.query(
+        `SELECT s.id, s.precio, s.precio_mensual, s.es_suscripcion
+         FROM shop_items_custom s
+         WHERE s.tipo='nickname' AND s.activo=true LIMIT 1`
+      );
+      if (!items.length)
+        return res.status(403).json({ ok:false, error:{code:'NOT_AVAILABLE',message:'Item no disponible'} });
+
+      const item = items[0];
+
+      // Verificar que haya comprado el permiso
+      const { rows: perm } = await db.query(
+        `SELECT 1 FROM user_custom_items uci WHERE uci.user_id=$1 AND uci.item_id=$2
+         UNION
+         SELECT 1 FROM user_subscriptions us WHERE us.user_id=$1 AND us.item_id=$2 AND us.activa=true`,
+        [req.user.id, item.id]
+      );
+      if (!perm.length)
+        return res.status(403).json({ ok:false, error:{code:'NOT_UNLOCKED',message:'Comprá el permiso de apodo primero'} });
+
+      // Cobrar precio por cambio (precio = costo de cada cambio, configurable en AdminEconomia)
+      const precioCambio = item.precio || 0;
+      if (precioCambio > 0) {
+        const { rows: accs } = await db.query(
+          `SELECT id FROM accounts WHERE user_id=$1 AND account_type='student'`, [req.user.id]);
+        if (!accs.length) throw new Error('Cuenta no encontrada');
+        const bal = await getBalance(accs[0].id);
+        if (bal < precioCambio)
+          return res.status(422).json({ ok:false, error:{code:'INSUFFICIENT_BALANCE',message:'Saldo insuficiente'} });
+
+        const client = await db.getClient();
+        try {
+          await client.query('BEGIN');
+          const treasury = await getTreasuryAccountId(client);
+          const txId = uuidv4();
+          await client.query(
+            `INSERT INTO transactions (id,type,description,initiated_by) VALUES ($1,'purchase','Cambio de apodo',$2)`,
+            [txId, req.user.id]);
+          await client.query(
+            `INSERT INTO ledger_entries (transaction_id,account_id,amount) VALUES ($1,$2,$3),($1,$4,$5)`,
+            [txId, accs[0].id, -precioCambio, treasury, precioCambio]);
+          await client.query('UPDATE users SET apodo=$1 WHERE id=$2', [clean, req.user.id]);
+          await client.query('COMMIT');
+        } catch(e) { await client.query('ROLLBACK'); throw e; }
+        finally { client.release(); }
+      } else {
+        await db.query('UPDATE users SET apodo=$1 WHERE id=$2', [clean, req.user.id]);
       }
-
-      await db.query('UPDATE users SET apodo=$1 WHERE id=$2', [clean, req.user.id]);
     } else {
       await db.query('UPDATE users SET apodo=NULL WHERE id=$1', [req.user.id]);
     }
     const { rows } = await db.query('SELECT apodo FROM users WHERE id=$1', [req.user.id]);
-    res.json({ ok: true, data: { apodo: rows[0].apodo } });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+    res.json({ ok:true, data:{ apodo: rows[0].apodo } });
+  } catch(err) {
+    res.status(500).json({ ok:false, error:{code:'SERVER_ERROR',message:err.message} });
   }
 });
 
@@ -419,5 +458,51 @@ router.patch('/avatar-bg', auth, async (req, res) => {
     res.json({ ok:true, data:{ avatar_bg } });
   } catch(err) {
     res.status(500).json({ ok:false, error:{code:'SERVER_ERROR', message:err.message} });
+  }
+});
+
+// ── GET /profile/loaned-items ─────────────────────────────────
+router.get('/loaned-items', auth, async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT * FROM loaned_items
+       WHERE user_id=$1 AND active=true
+       AND (expires_at IS NULL OR expires_at > NOW())
+       ORDER BY created_at DESC`,
+      [req.user.id]
+    );
+    res.json({ ok:true, data: rows });
+  } catch(err) {
+    res.status(500).json({ ok:false, error:{code:'SERVER_ERROR',message:err.message} });
+  }
+});
+
+// ── POST /profile/loaned-items (admin presta) ─────────────────
+router.post('/loaned-items', auth, roles('admin','teacher'), async (req, res) => {
+  try {
+    const { user_id, type, item_data, note, expires_days } = req.body;
+    if (!user_id||!type||!item_data)
+      return res.status(400).json({ ok:false, error:{code:'MISSING_FIELDS'} });
+    const expires_at = expires_days
+      ? new Date(Date.now() + expires_days * 86400000).toISOString()
+      : null;
+    const { rows } = await db.query(
+      `INSERT INTO loaned_items (user_id,type,item_data,note,expires_at,granted_by)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [user_id, type, JSON.stringify(item_data), note||null, expires_at, req.user.id]
+    );
+    res.status(201).json({ ok:true, data: rows[0] });
+  } catch(err) {
+    res.status(500).json({ ok:false, error:{code:'SERVER_ERROR',message:err.message} });
+  }
+});
+
+// ── DELETE /profile/loaned-items/:id (admin revoca) ───────────
+router.delete('/loaned-items/:id', auth, roles('admin'), async (req, res) => {
+  try {
+    await db.query(`UPDATE loaned_items SET active=false WHERE id=$1`, [req.params.id]);
+    res.json({ ok:true });
+  } catch(err) {
+    res.status(500).json({ ok:false, error:{code:'SERVER_ERROR',message:err.message} });
   }
 });
