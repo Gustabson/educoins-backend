@@ -258,14 +258,19 @@ async function grantPrize(userId, { tipo, valor }, grantedBy) {
 
 async function notifyUser(userId, payload) {
   try {
-    const { getIO } = require('../socket');
-    const io = getIO();
-    if (io) io.to(`user:${userId}`).emit('notification', payload);
-    // Also save to DB
+    try {
+      const { getIO } = require('../socket');
+      const io = getIO();
+      if (io) io.to(`user:${userId}`).emit('notification', payload);
+    } catch(e) {}
+    // Save to DB - notifications table has titulo NOT NULL
     await db.query(
-      `INSERT INTO notifications (user_id, tipo, mensaje, data)
-       VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING`,
-      [userId, payload.tipo, payload.mensaje, JSON.stringify(payload)]
+      `INSERT INTO notifications (user_id, tipo, titulo, cuerpo, data)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [userId, payload.tipo||'premio',
+       payload.mensaje||'Nuevo premio',
+       payload.mensaje||null,
+       JSON.stringify(payload)]
     ).catch(()=>{});
   } catch(e) {}
 }

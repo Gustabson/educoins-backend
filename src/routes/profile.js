@@ -110,7 +110,6 @@ router.patch('/apodo', auth, async (req, res) => {
   }
 });
 
-module.exports = router;
 
 // PATCH /profile/foto
 router.patch('/foto', auth, async (req, res) => {
@@ -544,3 +543,5 @@ router.delete('/loaned-items/:id', auth, roles('admin'), async (req, res) => {
     res.status(500).json({ ok:false, error:{code:'SERVER_ERROR',message:err.message} });
   }
 });
+
+module.exports = router;
