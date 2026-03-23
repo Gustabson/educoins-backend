@@ -70,7 +70,7 @@ router.get('/live', auth, async (req, res) => {
 
     // Ranking basado en monedas ganadas en el período
     const { rows } = await db.query(`
-      SELECT u.id, u.nombre, u.apodo, u.skin, u.border, u.avatar_bg, u.foto_url, u.rol,
+      SELECT u.id, u.nombre, u.apodo, u.skin, u.border, u.avatar_bg, u.foto_url, u.foto_url, u.rol,
         COALESCE(SUM(CASE WHEN le.amount > 0 AND t.created_at >= $1 THEN le.amount ELSE 0 END),0)::integer AS ganado_periodo,
         COALESCE(SUM(le.amount),0)::integer AS balance_total
       FROM users u

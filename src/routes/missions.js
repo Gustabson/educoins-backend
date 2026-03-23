@@ -68,7 +68,7 @@ router.get('/teacher', auth, roles('teacher','admin'), async (req, res) => {
 router.get('/classroom-students', auth, roles('teacher','admin'), async (req, res) => {
   try {
     const { rows } = await db.query(`
-      SELECT u.id, u.nombre, u.email, u.skin, u.border, u.total_earned,
+      SELECT u.id, u.nombre, u.email, u.skin, u.border, u.avatar_bg, u.foto_url, u.total_earned,
         COALESCE((SELECT SUM(le.amount) FROM ledger_entries le
            JOIN accounts a ON a.id=le.account_id
            WHERE a.user_id=u.id AND a.account_type IN ('student','teacher')),0)::integer AS balance,
@@ -166,7 +166,7 @@ router.get('/submissions', auth, roles('teacher','admin'), async (req, res) => {
     const isAdmin=req.user.rol==='admin';
     const { rows } = await db.query(`
       SELECT ms.*, m.titulo, m.recompensa, m.tipo, m.dificultad,
-             u.nombre AS alumno_nombre, u.skin, u.border
+             u.nombre AS alumno_nombre, u.skin, u.border, u.avatar_bg, u.foto_url
       FROM mission_submissions ms
       JOIN missions m ON ms.mission_id=m.id JOIN users u ON ms.student_id=u.id
       WHERE ms.estado=$1 AND ($2 OR m.created_by=$3) ORDER BY ms.submitted_at DESC

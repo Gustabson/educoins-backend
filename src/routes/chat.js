@@ -89,7 +89,7 @@ router.get('/global/messages', auth, async (req, res) => {
         COALESCE(u.apodo, u.nombre) AS sender_nombre,
         u.apodo AS sender_apodo,
         u.rol       AS sender_rol,
-        u.skin, u.border, u.avatar_bg
+        u.skin, u.border, u.avatar_bg, u.foto_url
       FROM messages m
       JOIN conversations c ON c.id = m.conversation_id AND c.type = 'global'
       LEFT JOIN users u ON u.id = m.sender_id
@@ -172,7 +172,7 @@ router.get('/classroom/messages', auth, async (req, res) => {
         COALESCE(u.apodo, u.nombre) AS sender_nombre,
         u.apodo AS sender_apodo,
         u.rol    AS sender_rol,
-        u.skin, u.border, u.avatar_bg
+        u.skin, u.border, u.avatar_bg, u.foto_url
       FROM messages m
       LEFT JOIN users u ON u.id = m.sender_id
       WHERE m.conversation_id = $1
@@ -222,7 +222,7 @@ router.get('/personal/:userId/messages', auth, async (req, res) => {
         u.id     AS sender_id,
         COALESCE(u.apodo, u.nombre) AS sender_nombre,
         u.apodo AS sender_apodo,
-        u.skin, u.border, u.avatar_bg
+        u.skin, u.border, u.avatar_bg, u.foto_url
       FROM messages m
       LEFT JOIN users u ON u.id = m.sender_id
       WHERE m.conversation_id = $1

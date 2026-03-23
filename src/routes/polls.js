@@ -184,7 +184,7 @@ router.get('/:id/comments', auth, async (req, res) => {
   try {
     const { rows } = await db.query(`
       SELECT pc.id, pc.texto, pc.created_at, pc.parent_id,
-        u.id AS user_id, u.nombre, u.rol, u.skin, u.border,
+        u.id AS user_id, u.nombre, u.rol, u.skin, u.border, u.avatar_bg, u.foto_url,
         (SELECT COUNT(*)::int FROM poll_comment_reactions WHERE comment_id=pc.id AND tipo='like')    AS likes,
         (SELECT COUNT(*)::int FROM poll_comment_reactions WHERE comment_id=pc.id AND tipo='dislike') AS dislikes,
         (SELECT tipo FROM poll_comment_reactions WHERE comment_id=pc.id AND user_id=$2)              AS mi_reaccion,
@@ -204,7 +204,7 @@ router.get('/:id/comments/:cid/replies', auth, async (req, res) => {
   try {
     const { rows } = await db.query(`
       SELECT pc.id, pc.texto, pc.created_at, pc.parent_id,
-        u.id AS user_id, u.nombre, u.rol, u.skin, u.border,
+        u.id AS user_id, u.nombre, u.rol, u.skin, u.border, u.avatar_bg, u.foto_url,
         (SELECT COUNT(*)::int FROM poll_comment_reactions WHERE comment_id=pc.id AND tipo='like')    AS likes,
         (SELECT COUNT(*)::int FROM poll_comment_reactions WHERE comment_id=pc.id AND tipo='dislike') AS dislikes,
         (SELECT tipo FROM poll_comment_reactions WHERE comment_id=pc.id AND user_id=$2)              AS mi_reaccion

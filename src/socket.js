@@ -21,7 +21,7 @@ function initSocket(io) {
       try { payload = jwt.verify(token, JWT_SECRET); }
       catch { return next(new Error('INVALID_TOKEN')); }
       const { rows } = await db.query(
-        'SELECT id, nombre, rol, skin, border, activo FROM users WHERE id = $1',
+        'SELECT id, nombre, apodo, rol, skin, border, avatar_bg, foto_url, activo FROM users WHERE id = $1',
         [payload.sub]
       );
       if (rows.length === 0 || !rows[0].activo) return next(new Error('ACCOUNT_INACTIVE'));
@@ -128,6 +128,8 @@ function initSocket(io) {
           sender_rol:         user.rol,
           skin:               user.skin,
           border:             user.border,
+          avatar_bg:          user.avatar_bg || null,
+          foto_url:           user.foto_url || null,
           sender_name_color:  senderNameColor,
         };
 
