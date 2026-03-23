@@ -116,17 +116,29 @@ module.exports = router;
 router.patch('/foto', auth, async (req, res) => {
   try {
     const { foto_url } = req.body;
+    if (foto_url === null || foto_url === undefined) {
+      // Always allow removing photo
+      await db.query('UPDATE users SET foto_url=NULL WHERE id=$1', [req.user.id]);
+      return res.json({ ok: true, data: { foto_url: null } });
+    }
+    // Check if user bought photo_profile access within the last hour
     const { rows: perm } = await db.query(`
-      SELECT 1 FROM user_custom_items uci
+      SELECT uci.created_at FROM user_custom_items uci
       JOIN shop_items_custom s ON s.id = uci.item_id
       WHERE uci.user_id = $1 AND s.tipo = 'photo_profile'
+      ORDER BY uci.created_at DESC LIMIT 1
     `, [req.user.id]);
     if (!perm.length)
-      return res.status(403).json({ ok: false, error: { code: 'NOT_UNLOCKED', message: 'Compra el item Foto de Perfil primero' } });
-    if (foto_url && foto_url.length > 500000)
-      return res.status(400).json({ ok: false, error: { code: 'TOO_LARGE' } });
-    await db.query('UPDATE users SET foto_url=$1 WHERE id=$2', [foto_url||null, req.user.id]);
-    res.json({ ok: true, data: { foto_url: foto_url||null } });
+      return res.status(403).json({ ok: false, error: { code: 'NOT_UNLOCKED', message: 'Comprá el acceso de foto primero' } });
+    // Check if within 1 hour
+    const purchased = new Date(perm[0].created_at);
+    const hourAgo = new Date(Date.now() - 60 * 60 * 1000);
+    if (purchased < hourAgo)
+      return res.status(403).json({ ok: false, error: { code: 'ACCESS_EXPIRED', message: 'El acceso de foto expiró, comprá de nuevo' } });
+    if (foto_url.length > 500000)
+      return res.status(400).json({ ok: false, error: { code: 'TOO_LARGE', message: 'Imagen muy grande (max ~500KB)' } });
+    await db.query('UPDATE users SET foto_url=$1 WHERE id=$2', [foto_url, req.user.id]);
+    res.json({ ok: true, data: { foto_url: foto_url } });
   } catch (err) {
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }
