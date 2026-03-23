@@ -66,7 +66,7 @@ router.patch('/apodo', auth, async (req, res) => {
       const { rows: perm } = await db.query(
         `SELECT 1 FROM user_custom_items uci WHERE uci.user_id=$1 AND uci.item_id=$2
          UNION
-         SELECT 1 FROM user_subscriptions us WHERE us.user_id=$1 AND us.item_id=$2 AND us.activa=true`,
+         SELECT 1 FROM subscriptions us WHERE us.user_id=$1 AND us.item_id=$2 AND us.activo=true`,
         [req.user.id, item.id]
       );
       if (!perm.length)
@@ -371,9 +371,9 @@ router.patch('/active-titles', auth, roles('student'), async (req, res) => {
       );
       // Also check if they have an active subscription for title_custom
       const { rows: sub } = await db.query(
-        `SELECT us.id FROM user_subscriptions us
+        `SELECT us.id FROM subscriptions us
          JOIN shop_items_custom s ON s.id=us.item_id
-         WHERE us.user_id=$1 AND s.tipo='title_custom' AND us.activa=true`,
+         WHERE us.user_id=$1 AND s.tipo='title_custom' AND us.activo=true`,
         [req.user.id]
       );
       if(!perm.length && !sub.length){
