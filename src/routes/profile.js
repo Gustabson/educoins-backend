@@ -30,7 +30,7 @@ router.post('/equip', auth, roles('student'), async (req, res) => {
 router.get('/ranking', auth, async (req, res) => {
   try {
     const { rows } = await db.query(
-      `SELECT id, nombre, apodo, total_earned, skin, border, title
+      `SELECT id, nombre, apodo, total_earned, skin, border, title, avatar_bg
        FROM users WHERE rol='student' AND activo=true
        ORDER BY total_earned DESC LIMIT 20`
     );
@@ -168,7 +168,7 @@ router.patch('/titulo-custom', auth, async (req, res) => {
 router.get('/user/:id', auth, async (req, res) => {
   try {
     const { rows } = await db.query(`
-      SELECT u.id, u.nombre, u.apodo, u.titulo_custom, u.skin, u.border, u.title,
+      SELECT u.id, u.nombre, u.apodo, u.titulo_custom, u.skin, u.border, u.avatar_bg, u.title,
              u.foto_url, u.total_earned, u.rol, u.estado, u.active_titles, u.avatar_bg,
              COALESCE(SUM(le.amount),0)::integer AS balance,
              (SELECT COUNT(*)::int FROM mission_submissions ms
@@ -288,7 +288,7 @@ router.post('/buy-item', auth, roles('student'), async (req, res) => {
 
     await client.query('COMMIT');
     const { rows: updated } = await db.query(
-      `SELECT unlocked_skins, unlocked_borders, unlocked_titles, skin, border, title FROM users WHERE id=$1`,
+      `SELECT unlocked_skins, unlocked_borders, unlocked_titles, skin, border, title, avatar_bg FROM users WHERE id=$1`,
       [req.user.id]);
     res.json({ ok:true, data: updated[0] });
   } catch(err) {

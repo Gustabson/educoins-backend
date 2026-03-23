@@ -253,7 +253,7 @@ router.get('/ranking', auth, roles('admin'), async (req, res) => {
 
     // Top holders = mayor balance actual
     const { rows: topHolders } = await db.query(`
-      SELECT u.id, u.nombre, u.apodo, u.skin, u.border, u.rol,
+      SELECT u.id, u.nombre, u.apodo, u.skin, u.border, u.avatar_bg, u.rol,
         COALESCE(SUM(le.amount),0)::integer AS balance
       FROM users u
       JOIN accounts a ON a.user_id=u.id AND a.account_type IN ('student','teacher')
@@ -264,7 +264,7 @@ router.get('/ranking', auth, roles('admin'), async (req, res) => {
 
     // Top por misiones ganadas
     const { rows: topMisiones } = await db.query(`
-      SELECT u.id, u.nombre, u.apodo, u.skin, u.border,
+      SELECT u.id, u.nombre, u.apodo, u.skin, u.border, u.avatar_bg,
         COALESCE(SUM(le.amount),0)::integer AS ganado_misiones,
         COUNT(DISTINCT ms.id)::int AS misiones_completadas
       FROM users u
@@ -278,7 +278,7 @@ router.get('/ranking', auth, roles('admin'), async (req, res) => {
 
     // Top check-in racha
     const { rows: topCheckin } = await db.query(`
-      SELECT u.id, u.nombre, u.apodo, u.skin, u.border,
+      SELECT u.id, u.nombre, u.apodo, u.skin, u.border, u.avatar_bg,
         MAX(dc.racha) AS racha_max,
         COUNT(dc.id)::int AS total_checkins
       FROM users u
