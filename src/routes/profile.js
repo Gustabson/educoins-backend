@@ -182,6 +182,12 @@ router.get('/user/:id', auth, async (req, res) => {
       GROUP BY u.id
     `, [req.params.id]);
     if (!rows.length) return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND' } });
+    // Also fetch earned titles for this user
+    const { rows: earned } = await db.query(
+      `SELECT * FROM earned_titles WHERE user_id=$1 AND (expires_at IS NULL OR expires_at > NOW()) ORDER BY created_at DESC`,
+      [req.params.id]
+    );
+    rows[0].earned_titles = earned;
     res.json({ ok: true, data: rows[0] });
   } catch (err) {
     console.error('publicProfile error:', err.message);
@@ -362,7 +368,7 @@ router.patch('/active-titles', auth, roles('student'), async (req, res) => {
   try {
     const { titles } = req.body;
     if (!Array.isArray(titles)) return res.status(400).json({ ok:false, error:{code:'INVALID'} });
-    if (titles.length > 3) return res.status(400).json({ ok:false, error:{code:'TOO_MANY', message:'Máximo 3 títulos'} });
+    if (titles.length > 5) return res.status(400).json({ ok:false, error:{code:'TOO_MANY', message:'Máximo 5 títulos'} });
 
     // Validate: each title is either a known system id or "custom:text"
     const VALID_IDS = ['tl1','tl2','tl3','tl4','tl5'];
@@ -486,6 +492,22 @@ router.get('/loaned-items', auth, async (req, res) => {
        AND (expires_at IS NULL OR expires_at > NOW())
        ORDER BY created_at DESC`,
       [req.user.id]
+    );
+    res.json({ ok:true, data: rows });
+  } catch(err) {
+    res.status(500).json({ ok:false, error:{code:'SERVER_ERROR',message:err.message} });
+  }
+});
+
+// ── GET /profile/loaned-items/:userId (admin ve préstamos de un alumno) ──
+router.get('/loaned-items/:userId', auth, roles('admin','teacher'), async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT * FROM loaned_items
+       WHERE user_id=$1 AND active=true
+       AND (expires_at IS NULL OR expires_at > NOW())
+       ORDER BY created_at DESC`,
+      [req.params.userId]
     );
     res.json({ ok:true, data: rows });
   } catch(err) {
