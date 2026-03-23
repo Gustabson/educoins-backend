@@ -126,12 +126,12 @@ router.patch('/foto', auth, async (req, res) => {
       SELECT uci.created_at FROM user_custom_items uci
       JOIN shop_items_custom s ON s.id = uci.item_id
       WHERE uci.user_id = $1 AND s.tipo = 'photo_profile'
-      ORDER BY uci.created_at DESC LIMIT 1
+      ORDER BY uci.purchased_at DESC LIMIT 1
     `, [req.user.id]);
     if (!perm.length)
       return res.status(403).json({ ok: false, error: { code: 'NOT_UNLOCKED', message: 'Comprá el acceso de foto primero' } });
     // Check if within 1 hour
-    const purchased = new Date(perm[0].created_at);
+    const purchased = new Date(perm[0].purchased_at);
     const hourAgo = new Date(Date.now() - 60 * 60 * 1000);
     if (purchased < hourAgo)
       return res.status(403).json({ ok: false, error: { code: 'ACCESS_EXPIRED', message: 'El acceso de foto expiró, comprá de nuevo' } });
