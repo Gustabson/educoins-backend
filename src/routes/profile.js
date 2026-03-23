@@ -118,7 +118,7 @@ router.get('/user/:id', auth, async (req, res) => {
   try {
     const { rows } = await db.query(`
       SELECT u.id, u.nombre, u.apodo, u.titulo_custom, u.skin, u.border, u.title,
-             u.foto_url, u.total_earned, u.rol, u.estado, u.active_titles,
+             u.foto_url, u.total_earned, u.rol, u.estado, u.active_titles, u.avatar_bg,
              COALESCE(SUM(le.amount),0)::integer AS balance,
              (SELECT COUNT(*)::int FROM mission_submissions ms
               WHERE ms.student_id=u.id AND ms.estado='aprobada') AS misiones,
@@ -348,6 +348,75 @@ router.patch('/active-titles', auth, roles('student'), async (req, res) => {
     );
 
     res.json({ ok:true, data:{ active_titles: titles } });
+  } catch(err) {
+    res.status(500).json({ ok:false, error:{code:'SERVER_ERROR', message:err.message} });
+  }
+});
+
+// ── GET /profile/earned-titles ────────────────────────────────
+router.get('/earned-titles', auth, async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT * FROM earned_titles WHERE user_id=$1 ORDER BY created_at DESC`,
+      [req.user.id]
+    );
+    res.json({ ok:true, data: rows });
+  } catch(err) {
+    res.status(500).json({ ok:false, error:{code:'SERVER_ERROR', message:err.message} });
+  }
+});
+
+// ── GET /profile/earned-titles/:userId (para ver el de otro) ──
+router.get('/earned-titles/:userId', auth, async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT * FROM earned_titles WHERE user_id=$1 ORDER BY created_at DESC`,
+      [req.params.userId]
+    );
+    res.json({ ok:true, data: rows });
+  } catch(err) {
+    res.status(500).json({ ok:false, error:{code:'SERVER_ERROR', message:err.message} });
+  }
+});
+
+// ── POST /profile/earned-titles (admin otorga) ────────────────
+router.post('/earned-titles', auth, roles('admin','teacher'), async (req, res) => {
+  try {
+    const { user_id, name, rarity, color, glow_color, emoji, note } = req.body;
+    if (!user_id||!name) return res.status(400).json({ ok:false, error:{code:'MISSING_FIELDS'} });
+    const VALID_RARITIES = ['common','rare','epic','legendary'];
+    if (rarity && !VALID_RARITIES.includes(rarity))
+      return res.status(400).json({ ok:false, error:{code:'INVALID_RARITY'} });
+
+    const { rows } = await db.query(
+      `INSERT INTO earned_titles (user_id,name,rarity,color,glow_color,emoji,note,granted_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [user_id, name.trim(), rarity||'common', color||'#ffffff',
+       glow_color||null, emoji||null, note||null, req.user.id]
+    );
+    res.status(201).json({ ok:true, data: rows[0] });
+  } catch(err) {
+    res.status(500).json({ ok:false, error:{code:'SERVER_ERROR', message:err.message} });
+  }
+});
+
+// ── DELETE /profile/earned-titles/:id (admin revoca) ─────────
+router.delete('/earned-titles/:id', auth, roles('admin'), async (req, res) => {
+  try {
+    await db.query(`DELETE FROM earned_titles WHERE id=$1`, [req.params.id]);
+    res.json({ ok:true });
+  } catch(err) {
+    res.status(500).json({ ok:false, error:{code:'SERVER_ERROR', message:err.message} });
+  }
+});
+
+// ── PATCH /profile/avatar-bg ──────────────────────────────────
+router.patch('/avatar-bg', auth, async (req, res) => {
+  try {
+    const { avatar_bg } = req.body;
+    await db.query('UPDATE users SET avatar_bg=$1 WHERE id=$2',
+      [avatar_bg ? JSON.stringify(avatar_bg) : null, req.user.id]);
+    res.json({ ok:true, data:{ avatar_bg } });
   } catch(err) {
     res.status(500).json({ ok:false, error:{code:'SERVER_ERROR', message:err.message} });
   }
