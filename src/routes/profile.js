@@ -220,13 +220,14 @@ router.get('/blocked', auth, async (req, res) => {
 // Body: { type: 'skin'|'border'|'title', item_id: string }
 router.post('/buy-item', auth, roles('student'), async (req, res) => {
   const { type, item_id } = req.body;
-  const VALID = ['skin','border','title'];
+  const VALID = ['skin','border','title','avatar_bg'];
   if (!VALID.includes(type)) return res.status(400).json({ ok:false, error:{code:'INVALID_TYPE'} });
 
   const PRICES = {
-    skin:   { s1:0, s2:150, s3:200, s4:250, s5:300, s6:350, s7:400, s8:500 },
-    border: { b1:0, b2:100, b3:150, b4:200, b5:300 },
-    title:  { tl1:0, tl2:100, tl3:200, tl4:300, tl5:500 },
+    skin:      { s1:0, s2:150, s3:200, s4:250, s5:300, s6:350, s7:400, s8:500 },
+    border:    { b1:0, b2:100, b3:150, b4:200, b5:300 },
+    title:     { tl1:0, tl2:100, tl3:200, tl4:300, tl5:500 },
+    avatar_bg: { ab0:0, ab1:80, ab2:80, ab3:80, ab4:80, ab5:100, ab6:150, ab7:150, ab8:200 },
   };
 
   const precio = PRICES[type]?.[item_id];
@@ -234,7 +235,10 @@ router.post('/buy-item', auth, roles('student'), async (req, res) => {
 
   const { getTreasuryAccountId, getBalance } = require('../services/balance');
   const { v4: uuidv4 } = require('uuid');
-  const arrCol = { skin:'unlocked_skins', border:'unlocked_borders', title:'unlocked_titles' }[type];
+  const arrCol = {
+    skin:'unlocked_skins', border:'unlocked_borders',
+    title:'unlocked_titles', avatar_bg:'unlocked_avatar_bgs'
+  }[type];
 
   const client = await db.getClient();
   try {

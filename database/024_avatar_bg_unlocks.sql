@@ -1,0 +1,1 @@
+ALTER TABLE users ADD COLUMN IF NOT EXISTS unlocked_avatar_bgs TEXT[] DEFAULT ARRAY['ab0'];
