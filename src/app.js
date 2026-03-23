@@ -19,7 +19,16 @@ const io = new Server(server, {
 initSocket(io);
 
 // ── Middlewares globales ──────────────────────────────────────
-app.use(cors());
+app.use(cors({
+  origin: [
+    'https://educoins-frontend.vercel.app',
+    'http://localhost:3000',
+    /\.vercel\.app$/,
+  ],
+  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization'],
+  credentials: true,
+}));
 app.use(express.json());
 
 // ── Rutas REST ────────────────────────────────────────────────
