@@ -255,8 +255,11 @@ router.get('/friends', auth, async (req, res) => {
         -- El "otro" usuario en la relacion
         CASE WHEN f.requester_id = $1 THEN f.addressee_id ELSE f.requester_id END AS user_id,
         CASE WHEN f.requester_id = $1 THEN ua.nombre     ELSE ur.nombre     END AS nombre,
+        CASE WHEN f.requester_id = $1 THEN ua.apodo      ELSE ur.apodo      END AS apodo,
         CASE WHEN f.requester_id = $1 THEN ua.skin       ELSE ur.skin       END AS skin,
         CASE WHEN f.requester_id = $1 THEN ua.border     ELSE ur.border     END AS border,
+        CASE WHEN f.requester_id = $1 THEN ua.avatar_bg  ELSE ur.avatar_bg  END AS avatar_bg,
+        CASE WHEN f.requester_id = $1 THEN ua.foto_url   ELSE ur.foto_url   END AS foto_url,
         CASE WHEN f.requester_id = $1 THEN ua.rol        ELSE ur.rol        END AS rol,
         -- soy yo el que envio la solicitud?
         (f.requester_id = $1) AS soy_requester
@@ -284,7 +287,7 @@ router.get('/users/search', auth, async (req, res) => {
     }
 
     const { rows } = await db.query(`
-      SELECT u.id, u.nombre, u.rol, u.skin, u.border, u.avatar_bg,
+      SELECT u.id, u.nombre, u.apodo, u.rol, u.skin, u.border, u.avatar_bg, u.foto_url,
         f.estado AS friendship_estado,
         f.id     AS friendship_id
       FROM users u
