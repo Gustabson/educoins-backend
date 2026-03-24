@@ -1,8 +1,8 @@
 // src/routes/prizes.js — Sistema de premios por ranking
 const router  = require('express').Router();
 const db      = require('../config/db');
-const { auth } = require('../middleware/auth');
-const { roles } = require('../middleware/roles');
+const auth  = require('../middleware/auth');
+const roles = require('../middleware/roles');
 
 // ── GET /prizes/sets — listar todos los prize sets con sus ítems ──
 router.get('/sets', auth, roles('admin'), async (req, res) => {
