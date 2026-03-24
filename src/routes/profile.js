@@ -369,13 +369,22 @@ router.patch('/active-titles', auth, roles('student'), async (req, res) => {
     if (!Array.isArray(titles)) return res.status(400).json({ ok:false, error:{code:'INVALID'} });
     if (titles.length > 5) return res.status(400).json({ ok:false, error:{code:'TOO_MANY', message:'Máximo 5 títulos'} });
 
-    // Validate: each title is either a known system id or "custom:text"
+    // Validate: each title is a system id, "custom:text", or "earned:uuid"
     const VALID_IDS = ['tl1','tl2','tl3','tl4','tl5'];
     for(const t of titles){
       if(!t) continue;
       if(t.startsWith('custom:')){
         const text = t.slice(7);
         if(text.length > 30) return res.status(400).json({ ok:false, error:{code:'TITLE_TOO_LONG'} });
+      } else if(t.startsWith('earned:')){
+        const earnedId = t.slice(7);
+        const { rows } = await db.query(
+          `SELECT id FROM earned_titles WHERE id=$1 AND user_id=$2
+           AND (expires_at IS NULL OR expires_at > NOW())`,
+          [earnedId, req.user.id]
+        );
+        if(!rows.length)
+          return res.status(400).json({ ok:false, error:{code:'EARNED_NOT_FOUND', message:`Título ganado no encontrado`} });
       } else if(!VALID_IDS.includes(t)){
         return res.status(400).json({ ok:false, error:{code:'INVALID_TITLE_ID', message: `ID inválido: ${t}`} });
       }
