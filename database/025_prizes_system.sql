@@ -52,3 +52,32 @@ ON CONFLICT DO NOTHING;
 -- active_titles sigue siendo JSONB array, el frontend controla el max
 -- earned_titles: agregar expires_at para títulos temporales
 ALTER TABLE earned_titles ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ DEFAULT NULL;
+
+-- Agregar daily a los prize sets
+INSERT INTO ranking_prize_sets (periodo, puesto) VALUES
+  ('daily',1), ('daily',2), ('daily',3)
+ON CONFLICT DO NOTHING;
+
+-- Tabla de configuración de ejecución programada
+CREATE TABLE IF NOT EXISTS prize_schedules (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  periodo     VARCHAR(10) NOT NULL UNIQUE CHECK (periodo IN ('daily','weekly','monthly')),
+  hora        TIME NOT NULL DEFAULT '18:00:00',  -- hora local de ejecución
+  dia_semana  INTEGER DEFAULT 5,  -- 1=lunes...7=domingo (para weekly)
+  dia_mes     INTEGER DEFAULT 1,  -- 1-28 (para monthly)
+  activo      BOOLEAN DEFAULT TRUE,
+  ultima_ejecucion TIMESTAMPTZ DEFAULT NULL,
+  created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+INSERT INTO prize_schedules (periodo, hora, dia_semana, dia_mes) VALUES
+  ('daily',  '18:00:00', NULL, NULL),
+  ('weekly', '18:00:00', 5,    NULL),
+  ('monthly','18:00:00', NULL, 1)
+ON CONFLICT (periodo) DO NOTHING;
+
+-- Ampliar prize_sets para soportar rangos de puestos
+ALTER TABLE ranking_prize_sets ADD COLUMN IF NOT EXISTS puesto_hasta INTEGER DEFAULT NULL;
+-- puesto=1, puesto_hasta=NULL → solo puesto 1
+-- puesto=4, puesto_hasta=10  → puestos 4 al 10
+-- puesto=11, puesto_hasta=0  → todos desde el 11 en adelante (0 = ∞)
