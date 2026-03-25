@@ -410,4 +410,96 @@ router.get('/admin/orders', auth, roles('admin'), async (req, res) => {
   } catch(e) { res.status(500).json({ ok:false, error:{code:'SERVER_ERROR',message:e.message} }); }
 });
 
+// ── GET /p2p/market — datos públicos del mercado (sin identidades) ─
+// Retorna: último precio, variación 24h, volumen, trades recientes, historial de precios
+router.get('/market', auth, async (req, res) => {
+  try {
+    // Trades completados recientes (sin nombres — solo para alumnos)
+    const { rows: trades } = await db.query(`
+      SELECT
+        o.amount,
+        o.price_ars,
+        o.total_ars,
+        o.updated_at AS executed_at
+      FROM p2p_orders o
+      WHERE o.status = 'completed'
+      ORDER BY o.updated_at DESC
+      LIMIT 50
+    `);
+
+    // Último precio negociado
+    const lastTrade = trades[0] || null;
+    const lastPrice = lastTrade ? parseFloat(lastTrade.price_ars) : null;
+
+    // Precio hace 24 horas (primer trade completado antes de 24h)
+    const { rows: prev24 } = await db.query(`
+      SELECT price_ars FROM p2p_orders
+      WHERE status='completed' AND updated_at <= NOW() - INTERVAL '24 hours'
+      ORDER BY updated_at DESC LIMIT 1
+    `);
+    const price24h = prev24[0] ? parseFloat(prev24[0].price_ars) : lastPrice;
+    const change24h = lastPrice && price24h
+      ? (((lastPrice - price24h) / price24h) * 100).toFixed(2)
+      : "0.00";
+
+    // Volumen 24h (EduCoins negociadas)
+    const { rows: vol } = await db.query(`
+      SELECT
+        COALESCE(SUM(amount), 0)::integer AS vol_edu,
+        COALESCE(SUM(total_ars), 0)::numeric(12,2) AS vol_ars,
+        COUNT(*)::integer AS trade_count
+      FROM p2p_orders
+      WHERE status='completed' AND updated_at >= NOW() - INTERVAL '24 hours'
+    `);
+
+    // Historial de precios: 1 punto por hora, últimas 24 horas
+    const { rows: history } = await db.query(`
+      SELECT
+        DATE_TRUNC('hour', updated_at) AS hora,
+        AVG(price_ars)::numeric(10,2) AS precio_promedio,
+        SUM(amount)::integer AS volumen,
+        COUNT(*)::integer AS trades
+      FROM p2p_orders
+      WHERE status='completed' AND updated_at >= NOW() - INTERVAL '24 hours'
+      GROUP BY hora
+      ORDER BY hora ASC
+    `);
+
+    // Mejor oferta activa (precio más bajo disponible para comprar)
+    const { rows: bestOffer } = await db.query(`
+      SELECT MIN(price_ars)::numeric(10,2) AS mejor_precio,
+             COUNT(*)::integer AS ofertas_activas,
+             SUM(amount)::integer AS edu_disponibles
+      FROM p2p_offers
+      WHERE status='active'
+    `);
+
+    res.json({
+      ok: true,
+      data: {
+        last_price:      lastPrice,
+        change_24h:      parseFloat(change24h),
+        volume_24h_edu:  parseInt(vol[0]?.vol_edu || 0),
+        volume_24h_ars:  parseFloat(vol[0]?.vol_ars || 0),
+        trade_count_24h: parseInt(vol[0]?.trade_count || 0),
+        best_offer_price: bestOffer[0]?.mejor_precio ? parseFloat(bestOffer[0].mejor_precio) : null,
+        active_offers:   parseInt(bestOffer[0]?.ofertas_activas || 0),
+        edu_disponibles: parseInt(bestOffer[0]?.edu_disponibles || 0),
+        price_history:   history.map(h => ({
+          hora:   h.hora,
+          precio: parseFloat(h.precio_promedio),
+          volumen: h.volumen,
+          trades:  h.trades,
+        })),
+        recent_trades: trades.slice(0, 20).map(t => ({
+          amount:      t.amount,
+          price_ars:   parseFloat(t.price_ars),
+          total_ars:   parseFloat(t.total_ars),
+          executed_at: t.executed_at,
+        })),
+      }
+    });
+  } catch(e) { res.status(500).json({ ok:false, error:{code:'SERVER_ERROR',message:e.message} }); }
+});
+
 module.exports = router;
