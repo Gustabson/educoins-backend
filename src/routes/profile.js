@@ -510,6 +510,29 @@ router.patch('/avatar-bg', auth, async (req, res) => {
   }
 });
 
+// ── GET /profile/my-prizes — todos los premios activos del alumno ──
+router.get('/my-prizes', auth, async (req, res) => {
+  try {
+    // Earned titles (no expirados)
+    const { rows: titles } = await db.query(
+      `SELECT *, 'titulo' AS prize_type FROM earned_titles
+       WHERE user_id=$1 ORDER BY created_at DESC`,
+      [req.user.id]
+    );
+    // Loaned items (no expirados)
+    const { rows: items } = await db.query(
+      `SELECT *, 'item' AS prize_type FROM loaned_items
+       WHERE user_id=$1
+       AND (expires_at IS NULL OR expires_at > NOW())
+       ORDER BY created_at DESC`,
+      [req.user.id]
+    );
+    res.json({ ok:true, data: { titles, items } });
+  } catch(err) {
+    res.status(500).json({ ok:false, error:{code:'SERVER_ERROR', message:err.message} });
+  }
+});
+
 // ── GET /profile/loaned-items ─────────────────────────────────
 router.get('/loaned-items', auth, async (req, res) => {
   try {

@@ -39,6 +39,7 @@ app.use('/api/v1/missions',     require('./routes/missions'));
 app.use('/api/v1/store',        require('./routes/store'));
 app.use('/api/v1/profile',      require('./routes/profile'));
 app.use('/api/v1/prizes',       require('./routes/prizes').router);
+app.use('/api/v1/p2p',          require('./routes/p2p'));
 app.use('/api/v1/admin',        require('./routes/admin'));
 app.use('/api/v1/posts',        require('./routes/posts'));
 app.use('/api/v1/polls',        require('./routes/polls'));
