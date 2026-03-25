@@ -448,6 +448,25 @@ router.get('/earned-titles/:userId', auth, async (req, res) => {
   }
 });
 
+// ── GET /profile/earned-titles/:userId/all (admin ve todos, incluyendo viejos) ──
+router.get('/earned-titles/:userId/all', auth, roles('admin','teacher'), async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT et.*, 
+        CASE WHEN et.expires_at IS NULL THEN 'permanent'
+             WHEN et.expires_at > NOW() THEN 'active'
+             ELSE 'expired' END AS status
+       FROM earned_titles et
+       WHERE et.user_id=$1
+       ORDER BY et.created_at DESC`,
+      [req.params.userId]
+    );
+    res.json({ ok:true, data: rows });
+  } catch(err) {
+    res.status(500).json({ ok:false, error:{code:'SERVER_ERROR', message:err.message} });
+  }
+});
+
 // ── POST /profile/earned-titles (admin otorga) ────────────────
 router.post('/earned-titles', auth, roles('admin','teacher'), async (req, res) => {
   try {

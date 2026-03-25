@@ -225,9 +225,21 @@ async function grantPrize(userId, { tipo, valor }, grantedBy) {
     }
 
     case 'skin': {
-      await db.query(
-        `UPDATE users SET unlocked_skins=array_append(unlocked_skins,$1) WHERE id=$2 AND NOT ($1=ANY(unlocked_skins))`,
-        [valor.item_id, userId]);
+      const expiresAtSkin = valor.expires_days
+        ? new Date(Date.now() + valor.expires_days * 86400000).toISOString() : null;
+      if (!expiresAtSkin) {
+        // Permanente → va a unlocked_skins
+        await db.query(
+          `UPDATE users SET unlocked_skins=array_append(unlocked_skins,$1) WHERE id=$2 AND NOT ($1=ANY(unlocked_skins))`,
+          [valor.item_id, userId]);
+      } else {
+        // Temporal → va a loaned_items
+        await db.query(
+          `INSERT INTO loaned_items (user_id,type,item_data,note,expires_at,granted_by)
+           VALUES ($1,'skin',$2,$3,$4,$5)`,
+          [userId, JSON.stringify({id:valor.item_id,name:valor.name}),
+           valor.note||'Premio', expiresAtSkin, grantedBy]);
+      }
       await notifyUser(userId, { tipo: 'premio', mensaje: `¡Ganaste la skin "${valor.name||valor.item_id}"!` });
       break;
     }
