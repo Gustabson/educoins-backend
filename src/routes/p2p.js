@@ -184,31 +184,70 @@ router.post('/offers/:id/order', auth, async (req, res) => {
   const client = await db.getClient();
   try {
     await client.query('BEGIN');
+
+    // Buscar la oferta sin filtrar por status — validar después
+    // Esto evita que una oferta "completed" por compra exacta bloquee reintentos
     const { rows: offer } = await client.query(
-      `SELECT * FROM p2p_offers WHERE id=$1 AND status='active' FOR UPDATE`, [req.params.id]);
-    if (!offer.length) { await client.query('ROLLBACK'); return res.status(404).json({ ok:false, error:{code:'OFFER_NOT_FOUND'} }); }
+      `SELECT * FROM p2p_offers WHERE id=$1 FOR UPDATE`, [req.params.id]);
+    if (!offer.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ ok:false, error:{code:'OFFER_NOT_FOUND'} });
+    }
     const o = offer[0];
-    const offerAmount   = parseInt(o.amount, 10);
-    const minOrder      = parseInt(o.min_order, 10) || 1;
-    const maxOrder      = Math.min(o.max_order ? parseInt(o.max_order, 10) : offerAmount, offerAmount);
-    if (o.seller_id === req.user.id) { await client.query('ROLLBACK'); return res.status(400).json({ ok:false, error:{code:'CANT_BUY_OWN'} }); }
-    if (amount < minOrder || amount > maxOrder) { await client.query('ROLLBACK'); return res.status(400).json({ ok:false, error:{code:'INVALID_AMOUNT', message:`Entre ${minOrder} y ${maxOrder} EduCoins`} }); }
-    if (amount > offerAmount) { await client.query('ROLLBACK'); return res.status(400).json({ ok:false, error:{code:'EXCEEDS_OFFER', message:`Solo quedan ${offerAmount} EduCoins disponibles`} }); }
+
+    // Validar que la oferta sigue disponible
+    if (!['active','paused'].includes(o.status)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ ok:false, error:{code:'OFFER_NOT_AVAILABLE',
+        message:'Esta oferta ya no está disponible'} });
+    }
+    if (o.status === 'paused') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ ok:false, error:{code:'OFFER_PAUSED',
+        message:'Esta oferta está pausada'} });
+    }
+
+    const offerAmount = parseInt(o.amount, 10);
+    if (offerAmount <= 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ ok:false, error:{code:'OFFER_EMPTY',
+        message:'No hay EduCoins disponibles en esta oferta'} });
+    }
+
+    const minOrder = parseInt(o.min_order, 10) || 1;
+    const maxOrder = Math.min(
+      o.max_order ? parseInt(o.max_order, 10) : offerAmount,
+      offerAmount  // nunca más que lo disponible
+    );
+
+    if (o.seller_id === req.user.id) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ ok:false, error:{code:'CANT_BUY_OWN'} });
+    }
+    if (amount < minOrder || amount > maxOrder) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ ok:false, error:{code:'INVALID_AMOUNT',
+        message:`Cantidad entre ${minOrder} y ${maxOrder} EduCoins`} });
+    }
 
     const deadline = new Date(Date.now() + ORDER_TIMEOUT_MIN * 60000);
     const { rows } = await client.query(
       `INSERT INTO p2p_orders (offer_id,buyer_id,seller_id,amount,price_ars,total_ars,payment_deadline)
        VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-      [o.id, req.user.id, o.seller_id, amount,
+      [o.id, req.user.id, o.seller_id,
+       amount,
        parseFloat(o.price_ars),
        parseFloat((amount * parseFloat(o.price_ars)).toFixed(2)),
        deadline]);
 
-    // Reducir disponible en la oferta
+    // Reducir disponible — si llega a 0 pasa a 'completed'
+    const newAmount = offerAmount - amount;
     await client.query(
-      `UPDATE p2p_offers SET amount=amount-$1, updated_at=NOW(),
-        status=CASE WHEN (amount-$1)<=0 THEN 'completed' ELSE status END
-       WHERE id=$2`, [amount, o.id]);
+      `UPDATE p2p_offers
+       SET amount=$1, updated_at=NOW(),
+           status=CASE WHEN $1 <= 0 THEN 'completed' ELSE status END
+       WHERE id=$2`,
+      [newAmount, o.id]);
 
     await client.query('COMMIT');
 
