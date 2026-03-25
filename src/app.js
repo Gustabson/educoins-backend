@@ -19,7 +19,7 @@ const io = new Server(server, {
 initSocket(io);
 
 // ── Middlewares globales ──────────────────────────────────────
-app.use(cors({
+const corsOptions = {
   origin: [
     'https://educoins-frontend.vercel.app',
     'http://localhost:3000',
@@ -28,7 +28,11 @@ app.use(cors({
   methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
   allowedHeaders: ['Content-Type','Authorization'],
   credentials: true,
-}));
+};
+
+// Responder preflight OPTIONS en todas las rutas — necesario para CORS con POST/PATCH/DELETE
+app.options('*', cors(corsOptions));
+app.use(cors(corsOptions));
 app.use(express.json());
 
 // ── Rutas REST ────────────────────────────────────────────────
