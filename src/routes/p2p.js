@@ -190,7 +190,7 @@ router.post('/offers/:id/order', auth, async (req, res) => {
     const o = offer[0];
     const offerAmount   = parseInt(o.amount, 10);
     const minOrder      = parseInt(o.min_order, 10) || 1;
-    const maxOrder      = o.max_order ? parseInt(o.max_order, 10) : offerAmount;
+    const maxOrder      = Math.min(o.max_order ? parseInt(o.max_order, 10) : offerAmount, offerAmount);
     if (o.seller_id === req.user.id) { await client.query('ROLLBACK'); return res.status(400).json({ ok:false, error:{code:'CANT_BUY_OWN'} }); }
     if (amount < minOrder || amount > maxOrder) { await client.query('ROLLBACK'); return res.status(400).json({ ok:false, error:{code:'INVALID_AMOUNT', message:`Entre ${minOrder} y ${maxOrder} EduCoins`} }); }
     if (amount > offerAmount) { await client.query('ROLLBACK'); return res.status(400).json({ ok:false, error:{code:'EXCEEDS_OFFER', message:`Solo quedan ${offerAmount} EduCoins disponibles`} }); }
@@ -199,7 +199,10 @@ router.post('/offers/:id/order', auth, async (req, res) => {
     const { rows } = await client.query(
       `INSERT INTO p2p_orders (offer_id,buyer_id,seller_id,amount,price_ars,total_ars,payment_deadline)
        VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-      [o.id, req.user.id, o.seller_id, amount, o.price_ars, Math.round(amount * parseFloat(o.price_ars) * 100) / 100, deadline]);
+      [o.id, req.user.id, o.seller_id, amount,
+       parseFloat(o.price_ars),
+       parseFloat((amount * parseFloat(o.price_ars)).toFixed(2)),
+       deadline]);
 
     // Reducir disponible en la oferta
     await client.query(
@@ -209,14 +212,16 @@ router.post('/offers/:id/order', auth, async (req, res) => {
 
     await client.query('COMMIT');
 
-    // Notify seller via socket
+    // Notificar al vendedor: nueva orden
     try {
       const { getIO } = require('../socket');
       const io = getIO();
-      if (io) io.to(`user:${o.seller_id}`).emit('p2p_order', {
-        type: 'new_order', orderId: rows[0].id,
-        amount, buyer: req.user.nombre
-      });
+      if (io) {
+        io.to(`user:${o.seller_id}`).emit('p2p_update', {
+          type: 'new_order', orderId: rows[0].id,
+          amount, buyer: req.user.nombre
+        });
+      }
     } catch(e) {}
 
     res.status(201).json({ ok:true, data: rows[0] });
@@ -255,13 +260,15 @@ router.patch('/orders/:id/payment-sent', auth, async (req, res) => {
       [comprobante_url||null, req.params.id, req.user.id]);
     if (!rows.length) return res.status(400).json({ ok:false, error:{code:'INVALID_STATE'} });
 
-    // Notify seller
+    // Notificar al vendedor en tiempo real
     try {
       const { getIO } = require('../socket');
       const io = getIO();
-      if (io) io.to(`user:${rows[0].seller_id}`).emit('p2p_order', {
-        type: 'payment_sent', orderId: rows[0].id
-      });
+      if (io) {
+        io.to(`user:${rows[0].seller_id}`).emit('p2p_update', {
+          type: 'payment_sent', orderId: rows[0].id
+        });
+      }
     } catch(e) {}
 
     res.json({ ok:true, data: rows[0] });
@@ -298,13 +305,15 @@ router.patch('/orders/:id/release', auth, async (req, res) => {
 
     await client.query('COMMIT');
 
-    // Notify buyer
+    // Notificar a comprador y vendedor en tiempo real
     try {
       const { getIO } = require('../socket');
       const io = getIO();
-      if (io) io.to(`user:${o.buyer_id}`).emit('p2p_order', {
-        type: 'completed', orderId: o.id, amount: o.amount
-      });
+      if (io) {
+        const payload = { type: 'order_completed', orderId: o.id, amount: o.amount };
+        io.to(`user:${o.buyer_id}`).emit('p2p_update', payload);
+        io.to(`user:${o.seller_id}`).emit('p2p_update', payload);
+      }
     } catch(e) {}
 
     res.json({ ok:true, data: { txId, amount: o.amount } });
@@ -325,11 +334,16 @@ router.patch('/orders/:id/dispute', auth, async (req, res) => {
       [reason||'Sin motivo especificado', req.params.id, req.user.id]);
     if (!rows.length) return res.status(400).json({ ok:false, error:{code:'INVALID_STATE'} });
 
-    // Notify admins via socket
+    // Notificar a ambas partes y admins
     try {
       const { getIO } = require('../socket');
       const io = getIO();
-      if (io) io.emit('p2p_dispute', { orderId: rows[0].id, reason });
+      if (io) {
+        const payload = { type: 'disputed', orderId: rows[0].id, reason };
+        io.to(`user:${rows[0].buyer_id}`).emit('p2p_update', payload);
+        io.to(`user:${rows[0].seller_id}`).emit('p2p_update', payload);
+        io.emit('p2p_dispute', payload);
+      }
     } catch(e) {}
 
     res.json({ ok:true, data: rows[0] });
@@ -504,6 +518,66 @@ router.get('/market', auth, async (req, res) => {
       }
     });
   } catch(e) { res.status(500).json({ ok:false, error:{code:'SERVER_ERROR',message:e.message} }); }
+});
+
+// ── GET /p2p/orders/:id/detail — detalle completo para admin/moderador ─
+router.get('/orders/:id/detail', auth, roles('admin','teacher'), async (req, res) => {
+  try {
+    const { rows } = await db.query(`
+      SELECT
+        o.*,
+        -- Comprador
+        b.nombre        AS buyer_nombre,
+        b.apodo         AS buyer_apodo,
+        b.email         AS buyer_email,
+        ba.id           AS buyer_account_id,
+        -- Vendedor
+        s.nombre        AS seller_nombre,
+        s.apodo         AS seller_apodo,
+        s.email         AS seller_email,
+        sa.id           AS seller_account_id,
+        -- Transacción de liberación
+        tx.id           AS release_tx_id,
+        tx.type         AS release_tx_type,
+        tx.created_at   AS release_tx_date,
+        tx.initiated_by AS release_tx_by,
+        -- Transacción de escrow original
+        etx.id          AS escrow_tx_id,
+        etx.created_at  AS escrow_tx_date,
+        -- Oferta original
+        of2.price_ars   AS original_price,
+        of2.payment_methods,
+        of2.instructions AS offer_instructions,
+        -- Moderador que resolvió (si hubo disputa)
+        mod.nombre      AS resolved_by_nombre
+      FROM p2p_orders o
+      JOIN users b  ON b.id = o.buyer_id
+      JOIN users s  ON s.id = o.seller_id
+      LEFT JOIN accounts ba  ON ba.user_id = o.buyer_id  AND ba.account_type = 'student'
+      LEFT JOIN accounts sa  ON sa.user_id = o.seller_id AND sa.account_type = 'student'
+      LEFT JOIN transactions tx  ON tx.id = o.release_tx_id
+      LEFT JOIN p2p_offers of2   ON of2.id = o.offer_id
+      LEFT JOIN transactions etx ON etx.id = of2.escrow_tx_id
+      LEFT JOIN users mod ON mod.id = o.dispute_resolved_by
+      WHERE o.id = $1
+    `, [req.params.id]);
+
+    if (!rows.length) return res.status(404).json({ ok:false, error:{code:'NOT_FOUND'} });
+
+    // Ledger entries de esta orden
+    const { rows: entries } = await db.query(`
+      SELECT le.*, a.account_type, u.nombre AS account_owner
+      FROM ledger_entries le
+      JOIN accounts a ON a.id = le.account_id
+      LEFT JOIN users u ON u.id = a.user_id
+      WHERE le.transaction_id = $1 OR le.transaction_id = $2
+      ORDER BY le.created_at ASC
+    `, [rows[0].release_tx_id, rows[0].escrow_tx_id].filter(Boolean));
+
+    res.json({ ok:true, data: { order: rows[0], ledger_entries: entries } });
+  } catch(e) {
+    res.status(500).json({ ok:false, error:{code:'SERVER_ERROR', message:e.message} });
+  }
 });
 
 module.exports = router;
