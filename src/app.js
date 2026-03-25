@@ -30,7 +30,7 @@ const corsOptions = {
   credentials: true,
 };
 
-// Responder preflight OPTIONS en todas las rutas — necesario para CORS con POST/PATCH/DELETE
+// Responder preflight OPTIONS — fix CORS 2026-03-25 00:30 en todas las rutas — necesario para CORS con POST/PATCH/DELETE
 app.options('*', cors(corsOptions));
 app.use(cors(corsOptions));
 app.use(express.json());
