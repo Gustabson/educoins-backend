@@ -200,16 +200,17 @@ router.get('/personal/:userId/messages', auth, async (req, res) => {
   try {
     const otherId = req.params.userId;
 
-    // Verificar amistad aceptada
-    const { rows: friendship } = await db.query(`
-      SELECT id FROM friendships
-      WHERE estado = 'accepted'
-        AND ((requester_id = $1 AND addressee_id = $2)
-          OR (requester_id = $2 AND addressee_id = $1))
+    // Verificar que existe una conversacion personal entre ambos (independiente de si siguen siendo amigos)
+    const { rows: convCheck } = await db.query(`
+      SELECT c.id FROM conversations c
+      JOIN conversation_members m1 ON m1.conversation_id = c.id AND m1.user_id = $1
+      JOIN conversation_members m2 ON m2.conversation_id = c.id AND m2.user_id = $2
+      WHERE c.type = 'personal'
+      LIMIT 1
     `, [req.user.id, otherId]);
 
-    if (friendship.length === 0) {
-      return res.status(403).json({ ok: false, error: { code: 'NOT_FRIENDS', message: 'Solo podes chatear con tus amigos' } });
+    if (convCheck.length === 0) {
+      return res.status(403).json({ ok: false, error: { code: 'NO_CONVERSATION', message: 'No hay conversacion con este usuario' } });
     }
 
     const convId = await getOrCreatePersonalConv(req.user.id, otherId);
@@ -252,7 +253,6 @@ router.get('/friends', auth, async (req, res) => {
         f.id        AS friendship_id,
         f.estado,
         f.created_at,
-        -- El "otro" usuario en la relacion
         CASE WHEN f.requester_id = $1 THEN f.addressee_id ELSE f.requester_id END AS user_id,
         CASE WHEN f.requester_id = $1 THEN ua.nombre     ELSE ur.nombre     END AS nombre,
         CASE WHEN f.requester_id = $1 THEN ua.apodo      ELSE ur.apodo      END AS apodo,
@@ -261,13 +261,15 @@ router.get('/friends', auth, async (req, res) => {
         CASE WHEN f.requester_id = $1 THEN ua.avatar_bg  ELSE ur.avatar_bg  END AS avatar_bg,
         CASE WHEN f.requester_id = $1 THEN ua.foto_url   ELSE ur.foto_url   END AS foto_url,
         CASE WHEN f.requester_id = $1 THEN ua.rol        ELSE ur.rol        END AS rol,
-        -- soy yo el que envio la solicitud?
         (f.requester_id = $1) AS soy_requester
       FROM friendships f
       JOIN users ur ON ur.id = f.requester_id
       JOIN users ua ON ua.id = f.addressee_id
       WHERE (f.requester_id = $1 OR f.addressee_id = $1)
         AND f.estado IN ('pending', 'accepted')
+        -- Filtro asimétrico: solo mostrar si YO no me eliminé
+        AND NOT (f.requester_id = $1 AND f.removed_by_requester)
+        AND NOT (f.addressee_id = $1 AND f.removed_by_addressee)
       ORDER BY f.estado DESC, f.created_at DESC
     `, [req.user.id]);
 
@@ -342,6 +344,17 @@ router.post('/friends/request', auth, async (req, res) => {
         RETURNING id, estado, created_at
       `, [req.user.id, addressee_id]);
 
+      // Notificar al destinatario en tiempo real
+      const { getIO } = require('../socket');
+      const io = getIO();
+      if (io) {
+        io.to(`user:${addressee_id}`).emit('friend_request', {
+          friendship_id: rows[0].id,
+          from_user_id:  req.user.id,
+          from_nombre:   req.user.nombre,
+        });
+      }
+
       res.status(201).json({ ok: true, data: { ...rows[0], nombre: target[0].nombre } });
     } catch (e) {
       if (e.code === '23505') {
@@ -372,6 +385,17 @@ router.post('/friends/:id/accept', auth, async (req, res) => {
     // Crear conversacion personal entre ambos
     await getOrCreatePersonalConv(rows[0].requester_id, rows[0].addressee_id);
 
+    // Notificar al requester en tiempo real
+    const { getIO } = require('../socket');
+    const io = getIO();
+    if (io) {
+      io.to(`user:${rows[0].requester_id}`).emit('friend_accepted', {
+        friendship_id: rows[0].id,
+        by_user_id:    req.user.id,
+        by_nombre:     req.user.nombre,
+      });
+    }
+
     res.json({ ok: true, data: rows[0] });
   } catch (err) {
     console.error('POST /chat/friends/:id/accept error:', err);
@@ -380,17 +404,35 @@ router.post('/friends/:id/accept', auth, async (req, res) => {
 });
 
 // ── DELETE /chat/friends/:id ──────────────────────────────────
+// Eliminación asimétrica: solo marca que YO eliminé, el otro sigue viéndolo
 router.delete('/friends/:id', auth, async (req, res) => {
   try {
-    const { rowCount } = await db.query(`
-      DELETE FROM friendships
+    const { rows, rowCount } = await db.query(`
+      UPDATE friendships
+      SET
+        removed_by_requester = CASE WHEN requester_id = $2 THEN TRUE ELSE removed_by_requester END,
+        removed_by_addressee = CASE WHEN addressee_id = $2 THEN TRUE ELSE removed_by_addressee END,
+        updated_at = NOW()
       WHERE id = $1
         AND (requester_id = $2 OR addressee_id = $2)
         AND estado = 'accepted'
+      RETURNING
+        requester_id, addressee_id,
+        CASE WHEN requester_id = $2 THEN addressee_id ELSE requester_id END AS other_id
     `, [req.params.id, req.user.id]);
 
     if (rowCount === 0) {
       return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND', message: 'Amistad no encontrada' } });
+    }
+
+    // Notificar al otro en tiempo real
+    const { getIO } = require('../socket');
+    const io = getIO();
+    if (io) {
+      io.to(`user:${rows[0].other_id}`).emit('friend_removed', {
+        friendship_id: req.params.id,
+        by_user_id: req.user.id,
+      });
     }
 
     res.json({ ok: true, data: { message: 'Amigo eliminado' } });
