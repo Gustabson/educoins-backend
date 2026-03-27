@@ -10,6 +10,8 @@ async function enrichPoll(pollId, userId) {
   const { rows: poll } = await db.query(`
     SELECT p.id, p.titulo, p.activa, p.fin, p.created_at,
            p.scope, p.classroom_id, p.weighted,
+           p.status, p.contexto, p.review_note,
+           p.created_by AS creador_id,
            u.nombre AS creador_nombre, u.rol AS creador_rol
     FROM polls p JOIN users u ON u.id = p.created_by
     WHERE p.id = $1
@@ -68,18 +70,53 @@ router.get('/', auth, async (req, res) => {
   try {
     const scope = req.query.scope || null;
     const cid   = req.query.classroom_id || null;
+    const isAdmin = req.user.rol === 'admin';
+
+    // Auto-cerrar polls expiradas
+    await db.query(
+      `UPDATE polls SET activa=FALSE WHERE activa=TRUE AND fin IS NOT NULL AND fin < NOW()`
+    );
+
+    // Admin ve todo activo + pendientes de todos; el resto ve activos + los propios
+    const adminClause = isAdmin ? "OR p.status='pending'" : "";
     const { rows } = await db.query(`
-      SELECT id FROM polls
-      WHERE ($1::text IS NULL OR scope=$1)
-        AND ($2::uuid IS NULL OR classroom_id=$2)
+      SELECT p.id FROM polls p
+      WHERE (
+        (p.activa=TRUE AND p.status='active'
+         AND ($1::text IS NULL OR p.scope=$1)
+         AND ($2::uuid IS NULL OR p.classroom_id=$2))
+        OR (p.created_by=$3 AND p.status IN ('pending','rejected'))
+        ${adminClause}
+      )
       ORDER BY
-        CASE WHEN (SELECT rol FROM users WHERE id=created_by)='admin'   THEN 0
-             WHEN (SELECT rol FROM users WHERE id=created_by)='teacher' THEN 1
+        CASE WHEN p.status='pending'  THEN 0
+             WHEN p.status='rejected' THEN 3
+             ELSE 1 END,
+        CASE WHEN (SELECT rol FROM users WHERE id=p.created_by)='admin'   THEN 0
+             WHEN (SELECT rol FROM users WHERE id=p.created_by)='teacher' THEN 1
              ELSE 2 END,
-        created_at DESC
-    `, [scope, cid]);
+        p.created_at DESC
+    `, [scope, cid, req.user.id]);
     const enriched = await Promise.all(rows.map(p => enrichPoll(p.id, req.user.id)));
     res.json({ ok: true, data: enriched.filter(Boolean) });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// GET /polls/pending — admin: lista propuestas esperando revisión
+router.get('/pending', auth, roles('admin'), async (req, res) => {
+  try {
+    const { rows } = await db.query(`
+      SELECT p.id, p.titulo, p.contexto, p.created_at, p.scope, p.weighted, p.fin,
+             p.created_by AS creador_id, u.nombre AS creador_nombre, u.rol AS creador_rol,
+             (SELECT json_agg(json_build_object('texto',po.texto,'orden',po.orden) ORDER BY po.orden)
+              FROM poll_options po WHERE po.poll_id=p.id) AS opciones
+      FROM polls p JOIN users u ON u.id=p.created_by
+      WHERE p.status='pending'
+      ORDER BY p.created_at ASC
+    `);
+    res.json({ ok: true, data: rows });
   } catch (err) {
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }
@@ -96,21 +133,31 @@ router.get('/:id', auth, async (req, res) => {
   }
 });
 
-// POST /polls
-router.post('/', auth, roles('admin','teacher'), async (req, res) => {
+// POST /polls — abierto a todos; staff publica directo, otros pasan por revisión
+router.post('/', auth, async (req, res) => {
   const client = await db.getClient();
   try {
-    const { titulo, opciones, fin, scope='global', classroom_id=null, weighted=false } = req.body;
-    if (!titulo?.trim() || titulo.trim().length < 3)
-      return res.status(400).json({ ok: false, error: { code: 'INVALID_TITULO' } });
+    const { titulo, opciones, fin, scope='global', classroom_id=null, weighted=false, contexto='' } = req.body;
+    const isStaff = ['admin','teacher'].includes(req.user.rol);
+
+    if (!titulo?.trim() || titulo.trim().length < 5)
+      return res.status(400).json({ ok: false, error: { code: 'INVALID_TITULO', message: 'El título debe tener al menos 5 caracteres' } });
     if (!Array.isArray(opciones) || opciones.length < 2 || opciones.length > 8)
       return res.status(400).json({ ok: false, error: { code: 'INVALID_OPTIONS' } });
+    // Alumnos y padres DEBEN describir el contexto
+    if (!isStaff && (!contexto?.trim() || contexto.trim().length < 20))
+      return res.status(400).json({ ok: false, error: { code: 'INVALID_CONTEXTO', message: 'La descripción del problema debe tener al menos 20 caracteres' } });
+
+    const activa  = isStaff;
+    const status  = isStaff ? 'active' : 'pending';
+    const finalScope = isStaff ? scope : 'global';
+    const finalCid   = isStaff ? classroom_id : null;
 
     await client.query('BEGIN');
     const { rows: poll } = await client.query(`
-      INSERT INTO polls (titulo, activa, fin, created_by, scope, classroom_id, weighted)
-      VALUES ($1,TRUE,$2,$3,$4,$5,$6) RETURNING id
-    `, [titulo.trim(), fin||null, req.user.id, scope, classroom_id, !!weighted]);
+      INSERT INTO polls (titulo, activa, fin, created_by, scope, classroom_id, weighted, contexto, status)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id
+    `, [titulo.trim(), activa, fin||null, req.user.id, finalScope, finalCid, !!weighted, contexto?.trim()||null, status]);
 
     for (let i = 0; i < opciones.length; i++)
       await client.query('INSERT INTO poll_options (poll_id,texto,orden) VALUES ($1,$2,$3)',
@@ -135,9 +182,8 @@ router.post('/:id/vote', auth, async (req, res) => {
     if (!poll.length) return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND' } });
     if (!poll[0].activa) return res.status(400).json({ ok: false, error: { code: 'POLL_CLOSED' } });
     if (poll[0].fin) {
-      const finDate = new Date(poll[0].fin);
-      finDate.setHours(23,59,59,999);
-      if (finDate < new Date()) return res.status(400).json({ ok: false, error: { code: 'POLL_EXPIRED', message: 'Esta votacion ya vencio' } });
+      if (new Date(poll[0].fin) < new Date())
+        return res.status(400).json({ ok: false, error: { code: 'POLL_EXPIRED', message: 'Esta votación ya venció' } });
     }
 
     const { rows: opt } = await db.query(
@@ -167,6 +213,41 @@ router.post('/:id/vote', auth, async (req, res) => {
     }
     const data = await enrichPoll(req.params.id, req.user.id);
     res.json({ ok: true, data });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// PATCH /polls/:id/review — admin aprueba o rechaza propuestas pendientes
+router.patch('/:id/review', auth, roles('admin'), async (req, res) => {
+  try {
+    const { action, note } = req.body;
+    if (!['approve','reject'].includes(action))
+      return res.status(400).json({ ok: false, error: { code: 'INVALID_ACTION' } });
+    const activa = action === 'approve';
+    const status = action === 'approve' ? 'active' : 'rejected';
+    await db.query(
+      `UPDATE polls SET activa=$1, status=$2, review_note=$3, review_by=$4 WHERE id=$5`,
+      [activa, status, note?.trim()||null, req.user.id, req.params.id]
+    );
+    const data = await enrichPoll(req.params.id, req.user.id);
+    res.json({ ok: true, data });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// DELETE /polls/:id — admin borra cualquiera; dueño puede retirar sus propuestas pending/rejected
+router.delete('/:id', auth, async (req, res) => {
+  try {
+    const { rows: poll } = await db.query('SELECT created_by, status FROM polls WHERE id=$1', [req.params.id]);
+    if (!poll.length) return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND' } });
+    const isOwner = poll[0].created_by === req.user.id;
+    const isAdmin = req.user.rol === 'admin';
+    if (!isAdmin && !(isOwner && ['pending','rejected'].includes(poll[0].status)))
+      return res.status(403).json({ ok: false, error: { code: 'FORBIDDEN' } });
+    await db.query('DELETE FROM polls WHERE id=$1', [req.params.id]);
+    res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }
@@ -316,14 +397,5 @@ router.delete('/:id/comments/:cid', auth, async (req, res) => {
   }
 });
 
-// DELETE /polls/:id
-router.delete('/:id', auth, roles('admin'), async (req, res) => {
-  try {
-    await db.query('DELETE FROM polls WHERE id=$1', [req.params.id]);
-    res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
-  }
-});
 
 module.exports = router;
