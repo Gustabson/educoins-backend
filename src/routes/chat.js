@@ -574,6 +574,30 @@ router.get('/groups', auth, async (req, res) => {
   }
 });
 
+// ── GET /chat/groups/:id/members ─────────────────────────────
+router.get('/groups/:id/members', auth, async (req, res) => {
+  try {
+    const { rows: access } = await db.query(
+      'SELECT 1 FROM conversation_members WHERE conversation_id=$1 AND user_id=$2',
+      [req.params.id, req.user.id]
+    );
+    if (access.length === 0) {
+      return res.status(403).json({ ok: false, error: { code: 'NOT_MEMBER', message: 'No sos miembro de este grupo' } });
+    }
+    const { rows } = await db.query(`
+      SELECT cm.user_id, cm.rol, u.nombre, u.apodo, u.skin, u.border, u.avatar_bg, u.foto_url
+      FROM conversation_members cm
+      JOIN users u ON u.id = cm.user_id
+      WHERE cm.conversation_id = $1
+      ORDER BY cm.rol DESC, u.nombre
+    `, [req.params.id]);
+    res.json({ ok: true, data: rows });
+  } catch (err) {
+    console.error('GET /chat/groups/:id/members error:', err);
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: 'Error al cargar miembros' } });
+  }
+});
+
 // ── GET /chat/groups/:id/messages ─────────────────────────────
 router.get('/groups/:id/messages', auth, async (req, res) => {
   try {
