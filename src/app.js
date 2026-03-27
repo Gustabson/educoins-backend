@@ -54,6 +54,7 @@ app.use('/api/v1/checkin',      require('./routes/checkin'));
 app.use('/api/v1/notifications',require('./routes/notifications'));
 app.use('/api/v1/ranking',      require('./routes/ranking'));
 app.use('/api/v1/subscriptions',require('./routes/subscriptions'));
+app.use('/api/v1/parent',       require('./routes/parent'));
 
 // ── Health check ──────────────────────────────────────────────
 app.get('/health', (req, res) => {

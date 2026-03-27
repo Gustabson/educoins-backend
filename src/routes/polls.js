@@ -172,11 +172,19 @@ router.post('/:id/vote', auth, async (req, res) => {
   }
 });
 
-// PATCH /polls/:id
-router.patch('/:id', auth, roles('admin'), async (req, res) => {
+// PATCH /polls/:id — admin puede cerrar cualquiera; teacher solo las propias
+router.patch('/:id', auth, async (req, res) => {
   try {
+    if (req.user.rol !== 'admin' && req.user.rol !== 'teacher') {
+      return res.status(403).json({ ok: false, error: { code: 'FORBIDDEN' } });
+    }
     const { activa } = req.body;
     if (typeof activa !== 'boolean') return res.status(400).json({ ok: false, error: { code: 'INVALID_BODY' } });
+    if (req.user.rol === 'teacher') {
+      const { rows } = await db.query('SELECT created_by FROM polls WHERE id=$1', [req.params.id]);
+      if (!rows.length || rows[0].created_by !== req.user.id)
+        return res.status(403).json({ ok: false, error: { code: 'FORBIDDEN', message: 'Solo podés cerrar tus propias votaciones' } });
+    }
     await db.query('UPDATE polls SET activa=$1 WHERE id=$2', [activa, req.params.id]);
     const data = await enrichPoll(req.params.id, req.user.id);
     res.json({ ok: true, data });

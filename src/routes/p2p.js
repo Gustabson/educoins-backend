@@ -16,7 +16,7 @@ async function getConfig() {
 async function getUserAccount(userId, client) {
   const q = client || db;
   const { rows } = await q.query(
-    `SELECT a.id FROM accounts a WHERE a.user_id=$1 AND a.account_type='student'`, [userId]);
+    `SELECT a.id FROM accounts a WHERE a.user_id=$1 AND a.is_active=true LIMIT 1`, [userId]);
   return rows[0]?.id;
 }
 

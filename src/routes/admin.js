@@ -45,11 +45,12 @@ router.post('/users', async (req, res) => {
     );
 
     // Crear cuenta automáticamente para el usuario
-    if (rol === 'student' || rol === 'teacher') {
+    const accountTypeMap = { student: 'student', teacher: 'teacher', parent: 'parent' };
+    if (accountTypeMap[rol]) {
       await client.query(
         `INSERT INTO accounts (id, user_id, account_type, label)
          VALUES ($1,$2,$3,$4)`,
-        [uuidv4(), userId, rol === 'student' ? 'student' : 'teacher', `Cuenta de ${nombre}`]
+        [uuidv4(), userId, accountTypeMap[rol], `Cuenta de ${nombre}`]
       );
     }
 
@@ -549,6 +550,66 @@ router.patch('/economy/:id', auth, roles('admin'), async (req, res) => {
     if (!rows.length)
       return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND' } });
     res.json({ ok: true, data: rows[0] });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// ── POST /admin/parent-link ───────────────────────────────────
+router.post('/parent-link', async (req, res) => {
+  try {
+    const { parent_id, student_id } = req.body;
+    if (!parent_id || !student_id)
+      return res.status(400).json({ ok: false, error: { code: 'MISSING_FIELDS' } });
+    // Verificar roles
+    const { rows: users } = await db.query(
+      'SELECT id, rol FROM users WHERE id = ANY($1)', [[parent_id, student_id]]);
+    const parent = users.find(u => u.id === parent_id);
+    const student = users.find(u => u.id === student_id);
+    if (!parent || parent.rol !== 'parent')
+      return res.status(400).json({ ok: false, error: { code: 'INVALID_PARENT', message: 'El usuario padre no tiene rol parent' } });
+    if (!student || student.rol !== 'student')
+      return res.status(400).json({ ok: false, error: { code: 'INVALID_STUDENT', message: 'El usuario hijo no tiene rol student' } });
+
+    await db.query(
+      `INSERT INTO parent_student_links (parent_id, student_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+      [parent_id, student_id]
+    );
+    res.status(201).json({ ok: true, data: { message: 'Vínculo creado' } });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// ── DELETE /admin/parent-link ─────────────────────────────────
+router.delete('/parent-link', async (req, res) => {
+  try {
+    const { parent_id, student_id } = req.body;
+    if (!parent_id || !student_id)
+      return res.status(400).json({ ok: false, error: { code: 'MISSING_FIELDS' } });
+    await db.query(
+      'DELETE FROM parent_student_links WHERE parent_id=$1 AND student_id=$2',
+      [parent_id, student_id]
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// ── GET /admin/parent-links ───────────────────────────────────
+router.get('/parent-links', async (req, res) => {
+  try {
+    const { rows } = await db.query(`
+      SELECT psl.id, psl.created_at,
+             p.id AS parent_id, p.nombre AS parent_nombre, p.email AS parent_email,
+             s.id AS student_id, s.nombre AS student_nombre, s.email AS student_email
+      FROM parent_student_links psl
+      JOIN users p ON p.id = psl.parent_id
+      JOIN users s ON s.id = psl.student_id
+      ORDER BY p.nombre, s.nombre
+    `);
+    res.json({ ok: true, data: rows });
   } catch (err) {
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }
