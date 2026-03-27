@@ -102,6 +102,19 @@ router.post('/send', auth, async (req, res) => {
       VALUES ($1, $2, $3, $4, $5)
     `, [to_user_id, type, titulo, cuerpo, JSON.stringify({ from_user_id: req.user.id })]);
 
+    // Emitir en tiempo real al destinatario
+    const { getIO } = require('../socket');
+    const io = getIO();
+    if (io) {
+      io.to(`user:${to_user_id}`).emit('notification', {
+        type,
+        titulo,
+        cuerpo,
+        from: req.user.nombre,
+        from_user_id: req.user.id,
+      });
+    }
+
     res.status(201).json({ ok: true });
   } catch (err) {
     console.error('POST /notifications/send error:', err);
