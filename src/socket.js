@@ -74,6 +74,18 @@ function initSocket(io) {
       } catch (err) { console.error('join_classroom error:', err); }
     });
 
+    // ── Chat grupal ──────────────────────────────────────────────
+    socket.on('join_group', async (conversationId) => {
+      try {
+        const { rows } = await db.query(
+          'SELECT 1 FROM conversation_members WHERE conversation_id=$1 AND user_id=$2',
+          [conversationId, user.id]
+        );
+        if (rows.length === 0) return;
+        socket.join(`group:${conversationId}`);
+      } catch (err) { console.error('join_group error:', err); }
+    });
+
     // ── Chat personal ────────────────────────────────────────────
     socket.on('join_personal', async (conversationId) => {
       try {
@@ -142,6 +154,8 @@ function initSocket(io) {
           if (conv.length > 0) room = `classroom:${conv[0].classroom_id}`;
         } else if (type === 'personal') {
           room = `personal:${conversation_id}`;
+        } else if (type === 'group') {
+          room = `group:${conversation_id}`;
         }
 
         if (room) io.to(room).emit('new_message', message);

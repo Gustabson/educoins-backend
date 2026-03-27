@@ -11,6 +11,9 @@
 // POST /api/v1/chat/friends/:id/reject     -> rechazar solicitud
 // GET  /api/v1/chat/classroom/info         -> info del aula del usuario
 // GET  /api/v1/chat/users/search           -> buscar usuarios para agregar
+// POST /api/v1/chat/groups                 -> crear grupo
+// GET  /api/v1/chat/groups                 -> mis grupos
+// GET  /api/v1/chat/groups/:id/messages    -> mensajes de un grupo
 
 const express = require('express');
 const router  = express.Router();
@@ -460,6 +463,153 @@ router.post('/friends/:id/reject', auth, async (req, res) => {
   } catch (err) {
     console.error('POST /chat/friends/:id/reject error:', err);
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: 'Error al rechazar solicitud' } });
+  }
+});
+
+// ── POST /chat/groups ─────────────────────────────────────────
+router.post('/groups', auth, async (req, res) => {
+  try {
+    let { nombre, icono, member_ids } = req.body;
+
+    nombre = (nombre || '').trim().substring(0, 40);
+    icono  = (icono  || '👥').trim().substring(0, 4) || '👥';
+
+    if (nombre.length < 2) {
+      return res.status(400).json({ ok: false, error: { code: 'INVALID_NAME', message: 'El nombre debe tener al menos 2 caracteres' } });
+    }
+    if (!Array.isArray(member_ids) || member_ids.length === 0) {
+      return res.status(400).json({ ok: false, error: { code: 'NO_MEMBERS', message: 'Seleccioná al menos un miembro' } });
+    }
+    const MAX_MEMBERS = 30;
+    if (member_ids.length > MAX_MEMBERS - 1) {
+      return res.status(400).json({ ok: false, error: { code: 'TOO_MANY_MEMBERS', message: `Máximo ${MAX_MEMBERS} miembros por grupo` } });
+    }
+
+    // Todos los miembros deben ser amigos del creador
+    const { rows: friends } = await db.query(`
+      SELECT CASE WHEN requester_id = $1 THEN addressee_id ELSE requester_id END AS friend_id
+      FROM friendships
+      WHERE (requester_id = $1 OR addressee_id = $1)
+        AND estado = 'accepted'
+        AND NOT (requester_id = $1 AND removed_by_requester)
+        AND NOT (addressee_id = $1 AND removed_by_addressee)
+    `, [req.user.id]);
+    const friendIds = new Set(friends.map(f => f.friend_id));
+    const invalid = member_ids.filter(id => !friendIds.has(id));
+    if (invalid.length > 0) {
+      return res.status(400).json({ ok: false, error: { code: 'NOT_FRIENDS', message: 'Solo podés agregar amigos al grupo' } });
+    }
+
+    // Límite: 10 grupos creados por usuario
+    const { rows: gc } = await db.query(
+      "SELECT COUNT(*)::int AS total FROM conversations WHERE type = 'group' AND created_by = $1",
+      [req.user.id]
+    );
+    if (gc[0].total >= 10) {
+      return res.status(400).json({ ok: false, error: { code: 'TOO_MANY_GROUPS', message: 'Máximo 10 grupos por usuario' } });
+    }
+
+    const client = await db.getClient();
+    try {
+      await client.query('BEGIN');
+      const { rows: conv } = await client.query(
+        "INSERT INTO conversations (type, nombre, icono, created_by) VALUES ('group',$1,$2,$3) RETURNING id",
+        [nombre, icono, req.user.id]
+      );
+      const convId = conv[0].id;
+      await client.query(
+        'INSERT INTO conversation_members (conversation_id, user_id, rol) VALUES ($1,$2,$3)',
+        [convId, req.user.id, 'owner']
+      );
+      for (const mid of member_ids) {
+        await client.query(
+          'INSERT INTO conversation_members (conversation_id, user_id, rol) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING',
+          [convId, mid, 'member']
+        );
+      }
+      await client.query('COMMIT');
+
+      const { getIO } = require('../socket');
+      const io = getIO();
+      if (io) {
+        member_ids.forEach(mid => {
+          io.to(`user:${mid}`).emit('group_added', { conversation_id: convId, nombre, icono, by_nombre: req.user.nombre });
+        });
+      }
+
+      res.status(201).json({ ok: true, data: { conversation_id: convId, nombre, icono } });
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error('POST /chat/groups error:', err);
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: 'Error al crear grupo' } });
+  }
+});
+
+// ── GET /chat/groups ──────────────────────────────────────────
+router.get('/groups', auth, async (req, res) => {
+  try {
+    const { rows } = await db.query(`
+      SELECT
+        c.id AS conversation_id, c.nombre, c.icono, c.created_at,
+        cm.rol AS my_rol,
+        COUNT(cm2.user_id)::int AS total_miembros
+      FROM conversations c
+      JOIN conversation_members cm  ON cm.conversation_id  = c.id AND cm.user_id = $1
+      JOIN conversation_members cm2 ON cm2.conversation_id = c.id
+      WHERE c.type = 'group'
+      GROUP BY c.id, c.nombre, c.icono, c.created_at, cm.rol
+      ORDER BY c.created_at DESC
+    `, [req.user.id]);
+    res.json({ ok: true, data: rows });
+  } catch (err) {
+    console.error('GET /chat/groups error:', err);
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: 'Error al cargar grupos' } });
+  }
+});
+
+// ── GET /chat/groups/:id/messages ─────────────────────────────
+router.get('/groups/:id/messages', auth, async (req, res) => {
+  try {
+    const convId = req.params.id;
+    const { rows: access } = await db.query(
+      'SELECT 1 FROM conversation_members WHERE conversation_id=$1 AND user_id=$2',
+      [convId, req.user.id]
+    );
+    if (access.length === 0) {
+      return res.status(403).json({ ok: false, error: { code: 'NOT_MEMBER', message: 'No sos miembro de este grupo' } });
+    }
+
+    const before = req.query.before || null;
+    const { rows } = await db.query(`
+      SELECT
+        m.id, m.texto, m.created_at, m.conversation_id,
+        u.id AS sender_id,
+        COALESCE(u.apodo, u.nombre) AS sender_nombre,
+        u.apodo AS sender_apodo, u.rol AS sender_rol,
+        u.skin, u.border, u.avatar_bg, u.foto_url
+      FROM messages m
+      LEFT JOIN users u ON u.id = m.sender_id
+      WHERE m.conversation_id = $1
+        AND ($2::timestamptz IS NULL OR m.created_at < $2)
+      ORDER BY m.created_at DESC
+      LIMIT $3
+    `, [convId, before, MSG_LIMIT]);
+
+    await db.query(`
+      INSERT INTO conversation_members (conversation_id, user_id, last_read_at)
+      VALUES ($1, $2, NOW())
+      ON CONFLICT (conversation_id, user_id) DO UPDATE SET last_read_at = NOW()
+    `, [convId, req.user.id]);
+
+    res.json({ ok: true, data: { messages: rows.reverse(), conversation_id: convId } });
+  } catch (err) {
+    console.error('GET /chat/groups/:id/messages error:', err);
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: 'Error al cargar mensajes del grupo' } });
   }
 });
 
