@@ -296,10 +296,16 @@ router.get('/users/search', auth, async (req, res) => {
         (f.addressee_id = $1 AND f.requester_id = u.id)
       WHERE u.id <> $1
         AND u.activo = TRUE
-        AND u.nombre ILIKE $2
-      ORDER BY u.nombre
-      LIMIT 10
-    `, [req.user.id, `%${q}%`]);
+        AND (u.nombre ILIKE $2 OR u.apodo ILIKE $2)
+      ORDER BY
+        -- Priorizar coincidencia exacta de apodo, luego nombre
+        CASE WHEN LOWER(u.apodo) = LOWER($3) THEN 0
+             WHEN LOWER(u.nombre) = LOWER($3) THEN 1
+             WHEN u.apodo ILIKE $2 THEN 2
+             ELSE 3 END,
+        COALESCE(u.apodo, u.nombre)
+      LIMIT 15
+    `, [req.user.id, `%${q}%`, q]);
 
     res.json({ ok: true, data: rows });
   } catch (err) {
