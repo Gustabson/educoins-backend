@@ -1,14 +1,15 @@
-// src/routes/polls.js — version completa con scope, likes, comentarios
-const express = require('express');
-const router  = express.Router();
-const db      = require('../config/db');
-const auth    = require('../middleware/auth');
-const roles   = require('../middleware/roles');
+// src/routes/polls.js — version completa con scope, likes, comentarios, DAO weighted voting
+const express    = require('express');
+const router     = express.Router();
+const db         = require('../config/db');
+const auth       = require('../middleware/auth');
+const roles      = require('../middleware/roles');
+const balanceSvc = require('../services/balance');
 
 async function enrichPoll(pollId, userId) {
   const { rows: poll } = await db.query(`
     SELECT p.id, p.titulo, p.activa, p.fin, p.created_at,
-           p.scope, p.classroom_id,
+           p.scope, p.classroom_id, p.weighted,
            u.nombre AS creador_nombre, u.rol AS creador_rol
     FROM polls p JOIN users u ON u.id = p.created_by
     WHERE p.id = $1
@@ -16,13 +17,15 @@ async function enrichPoll(pollId, userId) {
   if (poll.length === 0) return null;
 
   const { rows: options } = await db.query(`
-    SELECT po.id, po.texto, po.orden, COUNT(pv.id)::int AS votos
+    SELECT po.id, po.texto, po.orden,
+           COUNT(pv.id)::int AS votos,
+           COALESCE(SUM(pv.peso), 0)::numeric AS peso_total
     FROM poll_options po LEFT JOIN poll_votes pv ON pv.option_id = po.id
     WHERE po.poll_id = $1 GROUP BY po.id ORDER BY po.orden
   `, [pollId]);
 
   const { rows: myVote } = await db.query(
-    'SELECT option_id FROM poll_votes WHERE poll_id=$1 AND user_id=$2', [pollId, userId]);
+    'SELECT option_id, peso FROM poll_votes WHERE poll_id=$1 AND user_id=$2', [pollId, userId]);
 
   const { rows: reacts } = await db.query(
     'SELECT tipo, COUNT(*)::int AS total FROM poll_reactions WHERE poll_id=$1 GROUP BY tipo', [pollId]);
@@ -35,11 +38,25 @@ async function enrichPoll(pollId, userId) {
   const reactions = { like: 0, dislike: 0 };
   reacts.forEach(r => { reactions[r.tipo] = r.total; });
 
+  const total_peso = options.reduce((s, o) => s + parseFloat(o.peso_total), 0);
+
+  // Si es weighted y el usuario no ha votado, calcular su poder actual
+  let mi_poder = null;
+  if (poll[0].weighted && !myVote[0]) {
+    try {
+      const accountId = await balanceSvc.getAccountByUserId(userId);
+      mi_poder = await balanceSvc.getBalance(accountId);
+    } catch(e) { mi_poder = 0; }
+  }
+
   return {
     ...poll[0],
     opciones:          options,
     total_votos:       options.reduce((s, o) => s + o.votos, 0),
+    total_peso,
     mi_voto:           myVote[0]?.option_id || null,
+    mi_peso:           myVote[0]?.peso ? parseFloat(myVote[0].peso) : null,
+    mi_poder,
     reactions,
     mi_reaccion:       myReact[0]?.tipo || null,
     total_comentarios: cCount[0].total,
@@ -83,7 +100,7 @@ router.get('/:id', auth, async (req, res) => {
 router.post('/', auth, roles('admin','teacher'), async (req, res) => {
   const client = await db.getClient();
   try {
-    const { titulo, opciones, fin, scope='global', classroom_id=null } = req.body;
+    const { titulo, opciones, fin, scope='global', classroom_id=null, weighted=false } = req.body;
     if (!titulo?.trim() || titulo.trim().length < 3)
       return res.status(400).json({ ok: false, error: { code: 'INVALID_TITULO' } });
     if (!Array.isArray(opciones) || opciones.length < 2 || opciones.length > 8)
@@ -91,9 +108,9 @@ router.post('/', auth, roles('admin','teacher'), async (req, res) => {
 
     await client.query('BEGIN');
     const { rows: poll } = await client.query(`
-      INSERT INTO polls (titulo, activa, fin, created_by, scope, classroom_id)
-      VALUES ($1,TRUE,$2,$3,$4,$5) RETURNING id
-    `, [titulo.trim(), fin||null, req.user.id, scope, classroom_id]);
+      INSERT INTO polls (titulo, activa, fin, created_by, scope, classroom_id, weighted)
+      VALUES ($1,TRUE,$2,$3,$4,$5,$6) RETURNING id
+    `, [titulo.trim(), fin||null, req.user.id, scope, classroom_id, !!weighted]);
 
     for (let i = 0; i < opciones.length; i++)
       await client.query('INSERT INTO poll_options (poll_id,texto,orden) VALUES ($1,$2,$3)',
@@ -114,7 +131,7 @@ router.post('/:id/vote', auth, async (req, res) => {
     const { option_id } = req.body;
     if (!option_id) return res.status(400).json({ ok: false, error: { code: 'INVALID_OPTION' } });
 
-    const { rows: poll } = await db.query('SELECT activa, fin FROM polls WHERE id=$1', [req.params.id]);
+    const { rows: poll } = await db.query('SELECT activa, fin, weighted FROM polls WHERE id=$1', [req.params.id]);
     if (!poll.length) return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND' } });
     if (!poll[0].activa) return res.status(400).json({ ok: false, error: { code: 'POLL_CLOSED' } });
     if (poll[0].fin) {
@@ -127,9 +144,23 @@ router.post('/:id/vote', auth, async (req, res) => {
       'SELECT id FROM poll_options WHERE id=$1 AND poll_id=$2', [option_id, req.params.id]);
     if (!opt.length) return res.status(400).json({ ok: false, error: { code: 'INVALID_OPTION' } });
 
+    // Calcular peso del voto (balance actual si es DAO weighted)
+    let peso = 1;
+    if (poll[0].weighted) {
+      try {
+        const accountId = await balanceSvc.getAccountByUserId(req.user.id);
+        peso = await balanceSvc.getBalance(accountId);
+      } catch(e) {
+        return res.status(400).json({ ok: false, error: { code: 'NO_ACCOUNT', message: 'No tenés cuenta activa' } });
+      }
+      if (peso < 1) {
+        return res.status(400).json({ ok: false, error: { code: 'NO_COINS', message: 'Necesitás al menos 1 moneda para votar en esta propuesta DAO' } });
+      }
+    }
+
     try {
-      await db.query('INSERT INTO poll_votes (poll_id,option_id,user_id) VALUES ($1,$2,$3)',
-        [req.params.id, option_id, req.user.id]);
+      await db.query('INSERT INTO poll_votes (poll_id,option_id,user_id,peso) VALUES ($1,$2,$3,$4)',
+        [req.params.id, option_id, req.user.id, peso]);
     } catch(e) {
       if (e.code==='23505') return res.status(409).json({ ok: false, error: { code: 'ALREADY_VOTED' } });
       throw e;
