@@ -532,8 +532,9 @@ router.post('/groups', auth, async (req, res) => {
       const { getIO } = require('../socket');
       const io = getIO();
       if (io) {
-        member_ids.forEach(mid => {
-          io.to(`user:${mid}`).emit('group_added', { conversation_id: convId, nombre, icono, by_nombre: req.user.nombre });
+        // Notificar a miembros Y al creador
+        [...member_ids, req.user.id].forEach(uid => {
+          io.to(`user:${uid}`).emit('group_added', { conversation_id: convId, nombre, icono, by_nombre: req.user.nombre });
         });
       }
 
@@ -556,13 +557,14 @@ router.get('/groups', auth, async (req, res) => {
     const { rows } = await db.query(`
       SELECT
         c.id AS conversation_id, c.nombre, c.icono, c.created_at,
+        c.allow_invites,
         cm.rol AS my_rol,
         COUNT(cm2.user_id)::int AS total_miembros
       FROM conversations c
       JOIN conversation_members cm  ON cm.conversation_id  = c.id AND cm.user_id = $1
       JOIN conversation_members cm2 ON cm2.conversation_id = c.id
       WHERE c.type = 'group'
-      GROUP BY c.id, c.nombre, c.icono, c.created_at, cm.rol
+      GROUP BY c.id, c.nombre, c.icono, c.created_at, c.allow_invites, cm.rol
       ORDER BY c.created_at DESC
     `, [req.user.id]);
     res.json({ ok: true, data: rows });
@@ -610,6 +612,124 @@ router.get('/groups/:id/messages', auth, async (req, res) => {
   } catch (err) {
     console.error('GET /chat/groups/:id/messages error:', err);
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: 'Error al cargar mensajes del grupo' } });
+  }
+});
+
+// ── POST /chat/groups/:id/members ────────────────────────────
+// Cualquier miembro puede invitar a SUS propios amigos (si allow_invites=true)
+// El admin puede invitar a cualquiera que sea su amigo
+router.post('/groups/:id/members', auth, async (req, res) => {
+  try {
+    const convId = req.params.id;
+    const { user_id: newMemberId } = req.body;
+    if (!newMemberId) {
+      return res.status(400).json({ ok: false, error: { code: 'INVALID_BODY', message: 'Falta user_id' } });
+    }
+
+    // Verificar que el invitador es miembro
+    const { rows: myMembership } = await db.query(
+      'SELECT rol FROM conversation_members WHERE conversation_id=$1 AND user_id=$2',
+      [convId, req.user.id]
+    );
+    if (myMembership.length === 0) {
+      return res.status(403).json({ ok: false, error: { code: 'NOT_MEMBER', message: 'No sos miembro del grupo' } });
+    }
+    const isAdmin = myMembership[0].rol === 'owner';
+
+    // Si no es admin, verificar que allow_invites está activo
+    if (!isAdmin) {
+      const { rows: grp } = await db.query(
+        'SELECT allow_invites FROM conversations WHERE id=$1',
+        [convId]
+      );
+      if (!grp[0]?.allow_invites) {
+        return res.status(403).json({ ok: false, error: { code: 'INVITES_DISABLED', message: 'Solo el admin puede invitar en este grupo' } });
+      }
+    }
+
+    // El nuevo miembro debe ser amigo del INVITADOR (no del creador)
+    const { rows: friendship } = await db.query(`
+      SELECT 1 FROM friendships
+      WHERE (requester_id=$1 AND addressee_id=$2) OR (requester_id=$2 AND addressee_id=$1)
+        AND estado='accepted'
+        AND NOT (requester_id=$1 AND removed_by_requester)
+        AND NOT (addressee_id=$1 AND removed_by_addressee)
+    `, [req.user.id, newMemberId]);
+    if (friendship.length === 0) {
+      return res.status(400).json({ ok: false, error: { code: 'NOT_FRIENDS', message: 'Solo podés invitar a tus amigos' } });
+    }
+
+    // Verificar límite de miembros
+    const { rows: count } = await db.query(
+      'SELECT COUNT(*)::int AS total FROM conversation_members WHERE conversation_id=$1',
+      [convId]
+    );
+    if (count[0].total >= 30) {
+      return res.status(400).json({ ok: false, error: { code: 'TOO_MANY_MEMBERS', message: 'El grupo alcanzó el límite de 30 miembros' } });
+    }
+
+    await db.query(
+      'INSERT INTO conversation_members (conversation_id, user_id, rol) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING',
+      [convId, newMemberId, 'member']
+    );
+
+    const { getIO } = require('../socket');
+    const io = getIO();
+    if (io) {
+      io.to(`user:${newMemberId}`).emit('group_added', {
+        conversation_id: convId,
+        by_nombre: req.user.nombre,
+      });
+    }
+
+    res.status(201).json({ ok: true });
+  } catch (err) {
+    console.error('POST /chat/groups/:id/members error:', err);
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: 'Error al agregar miembro' } });
+  }
+});
+
+// ── PATCH /chat/groups/:id/settings ──────────────────────────
+// Solo el admin (owner) puede modificar configuración del grupo
+router.patch('/groups/:id/settings', auth, async (req, res) => {
+  try {
+    const convId = req.params.id;
+
+    const { rows: membership } = await db.query(
+      'SELECT rol FROM conversation_members WHERE conversation_id=$1 AND user_id=$2',
+      [convId, req.user.id]
+    );
+    if (membership.length === 0 || membership[0].rol !== 'owner') {
+      return res.status(403).json({ ok: false, error: { code: 'NOT_ADMIN', message: 'Solo el admin puede modificar el grupo' } });
+    }
+
+    const { allow_invites, nombre, icono } = req.body;
+    const updates = [];
+    const vals = [];
+    let i = 1;
+
+    if (allow_invites !== undefined) { updates.push(`allow_invites=$${i++}`); vals.push(allow_invites); }
+    if (nombre !== undefined) {
+      const n = nombre.trim().substring(0, 40);
+      if (n.length < 2) return res.status(400).json({ ok: false, error: { code: 'INVALID_NAME', message: 'Nombre muy corto' } });
+      updates.push(`nombre=$${i++}`); vals.push(n);
+    }
+    if (icono !== undefined) { updates.push(`icono=$${i++}`); vals.push(icono.trim().substring(0,4)||'👥'); }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ ok: false, error: { code: 'NO_CHANGES', message: 'Nada para actualizar' } });
+    }
+
+    vals.push(convId);
+    const { rows } = await db.query(
+      `UPDATE conversations SET ${updates.join(',')} WHERE id=$${i} RETURNING id, nombre, icono, allow_invites`,
+      vals
+    );
+
+    res.json({ ok: true, data: rows[0] });
+  } catch (err) {
+    console.error('PATCH /chat/groups/:id/settings error:', err);
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: 'Error al actualizar grupo' } });
   }
 });
 
