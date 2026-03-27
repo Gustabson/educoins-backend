@@ -74,6 +74,41 @@ router.post('/push/subscribe', auth, async (req, res) => {
   }
 });
 
+// ── POST /notifications/send ──────────────────────────────────
+// Enviar notificacion a otro usuario (ej: toque entre amigos)
+router.post('/send', auth, async (req, res) => {
+  try {
+    const { to_user_id, type, message } = req.body;
+    if (!to_user_id || !type) {
+      return res.status(400).json({ ok: false, error: { code: 'INVALID_BODY', message: 'Faltan campos requeridos' } });
+    }
+    if (to_user_id === req.user.id) {
+      return res.status(400).json({ ok: false, error: { code: 'SELF_NOTIF', message: 'No podes mandarte una notificacion a vos mismo' } });
+    }
+
+    const { rows: target } = await db.query(
+      'SELECT id FROM users WHERE id = $1 AND activo = TRUE',
+      [to_user_id]
+    );
+    if (target.length === 0) {
+      return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND', message: 'Usuario no encontrado' } });
+    }
+
+    const titulo = type === 'toque' ? '👋 Te mandaron un toque' : (message || type);
+    const cuerpo = message || '';
+
+    await db.query(`
+      INSERT INTO notifications (user_id, tipo, titulo, cuerpo, data)
+      VALUES ($1, $2, $3, $4, $5)
+    `, [to_user_id, type, titulo, cuerpo, JSON.stringify({ from_user_id: req.user.id })]);
+
+    res.status(201).json({ ok: true });
+  } catch (err) {
+    console.error('POST /notifications/send error:', err);
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 // ── DELETE /notifications/push/unsubscribe ────────────────────
 router.delete('/push/unsubscribe', auth, async (req, res) => {
   try {

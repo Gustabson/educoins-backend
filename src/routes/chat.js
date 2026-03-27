@@ -379,6 +379,27 @@ router.post('/friends/:id/accept', auth, async (req, res) => {
   }
 });
 
+// ── DELETE /chat/friends/:id ──────────────────────────────────
+router.delete('/friends/:id', auth, async (req, res) => {
+  try {
+    const { rowCount } = await db.query(`
+      DELETE FROM friendships
+      WHERE id = $1
+        AND (requester_id = $2 OR addressee_id = $2)
+        AND estado = 'accepted'
+    `, [req.params.id, req.user.id]);
+
+    if (rowCount === 0) {
+      return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND', message: 'Amistad no encontrada' } });
+    }
+
+    res.json({ ok: true, data: { message: 'Amigo eliminado' } });
+  } catch (err) {
+    console.error('DELETE /chat/friends/:id error:', err);
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: 'Error al eliminar amigo' } });
+  }
+});
+
 // ── POST /chat/friends/:id/reject ─────────────────────────────
 router.post('/friends/:id/reject', auth, async (req, res) => {
   try {
