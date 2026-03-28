@@ -247,11 +247,6 @@ router.get('/ranking', auth, roles('admin'), async (req, res) => {
   try {
     const classroomId = req.query.classroom_id || null;
 
-    // Filtro de aula: si se especifica, solo usuarios de esa aula
-    const aulaFilter = classroomId
-      ? `AND u.id IN (SELECT user_id FROM classroom_members WHERE classroom_id='${classroomId}')`
-      : '';
-
     // Top holders = mayor balance actual
     const { rows: topHolders } = await db.query(`
       SELECT u.id, u.nombre, u.apodo, u.skin, u.border, u.avatar_bg, u.foto_url, u.rol,
@@ -259,9 +254,10 @@ router.get('/ranking', auth, roles('admin'), async (req, res) => {
       FROM users u
       JOIN accounts a ON a.user_id=u.id AND a.account_type IN ('student','teacher')
       LEFT JOIN ledger_entries le ON le.account_id=a.id
-      WHERE u.activo=TRUE AND u.rol='student' ${aulaFilter}
+      WHERE u.activo=TRUE AND u.rol='student'
+        AND ($1::uuid IS NULL OR u.id IN (SELECT user_id FROM classroom_members WHERE classroom_id=$1::uuid))
       GROUP BY u.id ORDER BY balance DESC LIMIT 10
-    `);
+    `, [classroomId]);
 
     // Top por misiones ganadas
     const { rows: topMisiones } = await db.query(`
@@ -273,9 +269,10 @@ router.get('/ranking', auth, roles('admin'), async (req, res) => {
       JOIN transactions t ON t.id=ms.transaction_id AND t.type='reward'
       JOIN accounts a ON a.user_id=u.id
       JOIN ledger_entries le ON le.transaction_id=t.id AND le.account_id=a.id AND le.amount>0
-      WHERE u.activo=TRUE ${aulaFilter}
+      WHERE u.activo=TRUE
+        AND ($1::uuid IS NULL OR u.id IN (SELECT user_id FROM classroom_members WHERE classroom_id=$1::uuid))
       GROUP BY u.id ORDER BY ganado_misiones DESC LIMIT 10
-    `);
+    `, [classroomId]);
 
     // Top check-in racha
     const { rows: topCheckin } = await db.query(`
@@ -284,10 +281,11 @@ router.get('/ranking', auth, roles('admin'), async (req, res) => {
         COUNT(dc.id)::int AS total_checkins
       FROM users u
       JOIN daily_checkins dc ON dc.user_id=u.id
-      WHERE u.activo=TRUE ${aulaFilter}
+      WHERE u.activo=TRUE
+        AND ($1::uuid IS NULL OR u.id IN (SELECT user_id FROM classroom_members WHERE classroom_id=$1::uuid))
       GROUP BY u.id
       ORDER BY racha_max DESC, total_checkins DESC LIMIT 10
-    `);
+    `, [classroomId]);
 
     // Stats generales (de toda la escuela, no filtrada)
     const { rows: stats } = await db.query(`

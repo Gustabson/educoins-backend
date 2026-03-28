@@ -14,7 +14,11 @@ const server = http.createServer(app);
 
 // ── Socket.io ─────────────────────────────────────────────────
 const io = new Server(server, {
-  cors: { origin: '*', methods: ['GET', 'POST'] }
+  cors: {
+    origin: ['https://educoins-frontend.vercel.app', 'http://localhost:3000', /\.vercel\.app$/],
+    methods: ['GET', 'POST'],
+    credentials: true,
+  }
 });
 initSocket(io);
 app.set('io', io); // Exponer io para req.app.get('io') en rutas

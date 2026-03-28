@@ -181,18 +181,24 @@ router.post('/equip', auth, async (req, res) => {
     }
 
     const col = `${tipo}_id`;
-    // Para screen_mode custom, guardar también los colores elegidos
-    const extraCols = (tipo === 'screen_mode' && custom_bg_color)
-      ? `, custom_bg_color='${custom_bg_color}', custom_accent_color='${custom_accent_color||custom_bg_color}'`
-      : (tipo === 'text_style' && req.body.custom_txt_color)
-      ? `, custom_txt_color='${req.body.custom_txt_color}', custom_sub_color='${req.body.custom_sub_color||req.body.custom_txt_color}', custom_card_color='${req.body.custom_card_color||''}'`
-      : '';
-
+    // Para screen_mode/text_style con colores custom, hacer UPDATE separado con parámetros
     await db.query(`
       INSERT INTO user_custom_active (user_id, ${col}, updated_at)
       VALUES ($1, $2, NOW())
-      ON CONFLICT (user_id) DO UPDATE SET ${col}=$2${extraCols}, updated_at=NOW()
+      ON CONFLICT (user_id) DO UPDATE SET ${col}=$2, updated_at=NOW()
     `, [req.user.id, item_id || null]);
+
+    if (tipo === 'screen_mode' && custom_bg_color) {
+      await db.query(
+        `UPDATE user_custom_active SET custom_bg_color=$1, custom_accent_color=$2 WHERE user_id=$3`,
+        [custom_bg_color, custom_accent_color || custom_bg_color, req.user.id]
+      );
+    } else if (tipo === 'text_style' && req.body.custom_txt_color) {
+      await db.query(
+        `UPDATE user_custom_active SET custom_txt_color=$1, custom_sub_color=$2, custom_card_color=$3 WHERE user_id=$4`,
+        [req.body.custom_txt_color, req.body.custom_sub_color || req.body.custom_txt_color, req.body.custom_card_color || '', req.user.id]
+      );
+    }
 
     // Devolver activos completos con configs
     const { rows: active } = await db.query(`

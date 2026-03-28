@@ -212,6 +212,7 @@ router.get('/', auth, async (req, res) => {
       // Sección "Activas": polls activas + upcoming (inicio futuro, aún no arrancaron)
       queryText = `
         SELECT p.id FROM polls p
+        JOIN users u_order ON u_order.id = p.created_by
         WHERE p.status='active'
         AND (
           p.activa=TRUE
@@ -221,9 +222,9 @@ router.get('/', auth, async (req, res) => {
         AND ($2::uuid IS NULL OR p.classroom_id=$2)
         AND ($3::text IS NULL OR p.titulo ILIKE '%' || $3 || '%' OR p.poll_number::text = LTRIM($3, '#'))
         ORDER BY
-          CASE WHEN p.activa=FALSE THEN 0 ELSE 1 END,  -- upcoming primero dentro de cada jerarquía
-          CASE WHEN (SELECT rol FROM users WHERE id=p.created_by)='admin'   THEN 0
-               WHEN (SELECT rol FROM users WHERE id=p.created_by)='teacher' THEN 1
+          CASE WHEN p.activa=FALSE THEN 0 ELSE 1 END,
+          CASE WHEN u_order.rol='admin'   THEN 0
+               WHEN u_order.rol='teacher' THEN 1
                ELSE 2 END,
           p.created_at DESC
       `;
@@ -245,7 +246,16 @@ router.get('/snapshot', auth, async (req, res) => {
   try {
     const scope = req.query.scope || 'global';
     const cid   = req.query.classroom_id || null;
-    const snap  = await takeSnapshot(scope, cid);
+    const isStaff = ['admin','teacher'].includes(req.user.rol);
+    // Verificar acceso al aula si no es staff
+    if (scope === 'aula' && cid && !isStaff) {
+      const { rows } = await db.query(
+        'SELECT 1 FROM classroom_members WHERE classroom_id=$1 AND user_id=$2',
+        [cid, req.user.id]
+      );
+      if (!rows.length) return res.status(403).json({ ok: false, error: { code: 'FORBIDDEN' } });
+    }
+    const snap = await takeSnapshot(scope, cid);
     res.json({ ok: true, data: snap });
   } catch (err) {
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
