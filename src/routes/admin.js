@@ -555,6 +555,44 @@ router.patch('/economy/:id', auth, roles('admin'), async (req, res) => {
   }
 });
 
+// ── GET /admin/quorum-settings ────────────────────────────────
+router.get('/quorum-settings', async (req, res) => {
+  try {
+    const { rows } = await db.query('SELECT * FROM quorum_settings ORDER BY scope');
+    res.json({ ok: true, data: rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// ── PATCH /admin/quorum-settings/:scope ───────────────────────
+router.patch('/quorum-settings/:scope', async (req, res) => {
+  try {
+    const { scope } = req.params;
+    const { threshold, mode } = req.body;
+    if (!['aula','global'].includes(scope))
+      return res.status(400).json({ ok: false, error: { code: 'INVALID_SCOPE' } });
+    if (threshold !== undefined && (Number(threshold) < 1 || Number(threshold) > 100))
+      return res.status(400).json({ ok: false, error: { code: 'INVALID_THRESHOLD', message: 'El umbral debe estar entre 1 y 100' } });
+    if (mode !== undefined && !['people','coins'].includes(mode))
+      return res.status(400).json({ ok: false, error: { code: 'INVALID_MODE' } });
+
+    await db.query(
+      `UPDATE quorum_settings SET
+        threshold  = COALESCE($1, threshold),
+        mode       = COALESCE($2, mode),
+        updated_by = $3,
+        updated_at = NOW()
+       WHERE scope = $4`,
+      [threshold ?? null, mode ?? null, req.user.id, scope]
+    );
+    const { rows } = await db.query('SELECT * FROM quorum_settings ORDER BY scope');
+    res.json({ ok: true, data: rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 // ── POST /admin/parent-link ───────────────────────────────────
 router.post('/parent-link', async (req, res) => {
   try {
