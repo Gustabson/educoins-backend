@@ -302,13 +302,18 @@ router.get('/:id/voters', auth, async (req, res) => {
   }
 });
 
-// POST /polls — siempre DAO weighted; inicio programado con snapshot automático
+// POST /polls — siempre DAO weighted; inicio/fin calculados en servidor
 router.post('/', auth, async (req, res) => {
   const client = await db.getClient();
   try {
-    const { titulo, opciones, inicio: inicioRaw, fin, scope='global', classroom_id=null, contexto='' } = req.body;
-    const isStaff    = ['admin','teacher'].includes(req.user.rol);
-    const weighted   = true;   // Siempre DAO ponderado por monedas
+    const {
+      titulo, opciones,
+      delay_valor=0, delay_unidad='dias',
+      dur_valor=24,  dur_unidad='horas',
+      scope='global', classroom_id=null, contexto=''
+    } = req.body;
+    const isStaff  = ['admin','teacher'].includes(req.user.rol);
+    const weighted = true;
 
     if (!titulo?.trim() || titulo.trim().length < 5)
       return res.status(400).json({ ok: false, error: { code: 'INVALID_TITULO', message: 'El título debe tener al menos 5 caracteres' } });
@@ -317,13 +322,31 @@ router.post('/', auth, async (req, res) => {
     if (!isStaff && (!contexto?.trim() || contexto.trim().length < 20))
       return res.status(400).json({ ok: false, error: { code: 'INVALID_CONTEXTO', message: 'La descripción del problema debe tener al menos 20 caracteres' } });
 
-    // Validar inicio programado
-    const inicioDate = inicioRaw ? new Date(inicioRaw) : null;
+    // Validar delay para globales (mínimo 1 día, calculado en el servidor)
+    const delayVal = Math.max(0, parseInt(delay_valor) || 0);
     if (scope === 'global') {
-      const minInicio = new Date(Date.now() + 24 * 60 * 60 * 1000);
-      if (!inicioDate || inicioDate < minInicio)
-        return res.status(400).json({ ok: false, error: { code: 'TOO_EARLY', message: 'Las votaciones globales deben comenzar al menos 24 horas después de ser creadas' } });
+      const delayHoras = delay_unidad === 'dias' ? delayVal * 24
+                       : delay_unidad === 'horas' ? delayVal : delayVal / 60;
+      if (delayHoras < 24)
+        return res.status(400).json({ ok: false, error: { code: 'TOO_EARLY', message: 'Las votaciones globales deben comenzar al menos 1 día después de crearse' } });
     }
+
+    // Calcular inicio y fin en el servidor (inmune a manipulación del reloj del cliente)
+    const DUR_MAX = { minutos: 1440, horas: 480, dias: 20 };
+    const durVal  = Math.min(Math.max(1, parseInt(dur_valor) || 1), DUR_MAX[dur_unidad] || 480);
+    const now     = new Date();
+    const inicioD = new Date(now);
+    if (delayVal > 0) {
+      if (delay_unidad === 'minutos') inicioD.setMinutes(inicioD.getMinutes() + delayVal);
+      else if (delay_unidad === 'horas') inicioD.setHours(inicioD.getHours() + delayVal);
+      else inicioD.setDate(inicioD.getDate() + delayVal);
+    }
+    const finD = new Date(inicioD);
+    if (dur_unidad === 'minutos') finD.setMinutes(finD.getMinutes() + durVal);
+    else if (dur_unidad === 'horas') finD.setHours(finD.getHours() + durVal);
+    else finD.setDate(finD.getDate() + durVal);
+    const inmediato  = delayVal === 0;
+    const inicioDate = inmediato ? null : inicioD;
 
     const finalScope = scope || 'global';
     let   finalCid   = null;
@@ -341,10 +364,7 @@ router.post('/', auth, async (req, res) => {
       finalCid = classroom_id;
     }
 
-    // Si inicio es en el futuro: activa=false y snapshot se tomará al abrir
-    // Si inicio es ahora o null: activa=true y snapshot se toma ahora
-    const inmediato = !inicioDate || inicioDate <= new Date();
-    const activa    = inmediato;
+    const activa = inmediato;
     let snapCoinsVal = 0, snapVoters = 0;
     if (inmediato) {
       const snap = await takeSnapshot(finalScope, finalCid);
@@ -356,7 +376,7 @@ router.post('/', auth, async (req, res) => {
     const { rows: poll } = await client.query(`
       INSERT INTO polls (titulo, activa, inicio, fin, created_by, scope, classroom_id, weighted, contexto, status, snapshot_total_coins, snapshot_total_voters)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id
-    `, [titulo.trim(), activa, inicioDate||null, fin||null, req.user.id, finalScope, finalCid, weighted, contexto?.trim()||null, 'active', snapCoinsVal, snapVoters]);
+    `, [titulo.trim(), activa, inicioDate, finD, req.user.id, finalScope, finalCid, weighted, contexto?.trim()||null, 'active', snapCoinsVal, snapVoters]);
 
     for (let i = 0; i < opciones.length; i++)
       await client.query('INSERT INTO poll_options (poll_id,texto,orden) VALUES ($1,$2,$3)',
@@ -471,10 +491,12 @@ router.patch('/:id/review', auth, roles('admin'), async (req, res) => {
 // PATCH /polls/:id/approve — admin aprueba oficialmente una votación cerrada
 router.patch('/:id/approve', auth, roles('admin'), async (req, res) => {
   try {
-    const { rows: poll } = await db.query('SELECT id, status FROM polls WHERE id=$1', [req.params.id]);
+    const { rows: poll } = await db.query('SELECT id, status, activa, fin FROM polls WHERE id=$1', [req.params.id]);
     if (!poll.length) return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND' } });
     if (poll[0].status === 'approved')
       return res.status(409).json({ ok: false, error: { code: 'ALREADY_APPROVED' } });
+    if (poll[0].activa || !poll[0].fin || new Date(poll[0].fin) > new Date())
+      return res.status(400).json({ ok: false, error: { code: 'POLL_NOT_CLOSED', message: 'Solo se pueden aprobar votaciones que ya terminaron' } });
     await db.query(
       `UPDATE polls SET status='approved', approved_at=NOW(), approved_by=$1 WHERE id=$2`,
       [req.user.id, req.params.id]
