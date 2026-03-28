@@ -17,6 +17,7 @@ const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] }
 });
 initSocket(io);
+app.set('io', io); // Exponer io para req.app.get('io') en rutas
 
 // ── Middlewares globales ──────────────────────────────────────
 const corsOptions = {

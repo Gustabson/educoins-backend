@@ -59,11 +59,14 @@ async function calculateQuorum(pollId, poll, options, qs) {
   return { threshold: parseFloat(threshold), mode, eligible, current, required, met, pct };
 }
 
-async function enrichPoll(pollId, userId, quorumMap) {
+async function enrichPoll(pollId, userId, quorumMap, userRole) {
   const { rows: poll } = await db.query(`
     SELECT p.id, p.titulo, p.activa, p.fin, p.created_at,
            p.scope, p.classroom_id, p.weighted,
            p.status, p.contexto, p.review_note,
+           p.poll_number,
+           p.snapshot_total_coins, p.snapshot_total_voters,
+           p.approved_at,
            p.created_by AS creador_id,
            u.nombre AS creador_nombre, u.rol AS creador_rol
     FROM polls p JOIN users u ON u.id = p.created_by
@@ -98,10 +101,15 @@ async function enrichPoll(pollId, userId, quorumMap) {
   // Si es weighted y el usuario no ha votado, calcular su poder actual
   let mi_poder = null;
   if (poll[0].weighted && !myVote[0]) {
-    try {
-      const accountId = await balanceSvc.getAccountByUserId(userId);
-      mi_poder = await balanceSvc.getBalance(accountId);
-    } catch(e) { mi_poder = 0; }
+    if (userRole === 'admin') {
+      // Admin representa el 3% de las monedas en circulación al snapshot
+      mi_poder = parseFloat(poll[0].snapshot_total_coins || 0) * 0.03;
+    } else {
+      try {
+        const accountId = await balanceSvc.getAccountByUserId(userId);
+        mi_poder = await balanceSvc.getBalance(accountId);
+      } catch(e) { mi_poder = 0; }
+    }
   }
 
   const total_votos = options.reduce((s, o) => s + o.votos, 0);
@@ -126,32 +134,98 @@ async function enrichPoll(pollId, userId, quorumMap) {
 // GET /polls
 router.get('/', auth, async (req, res) => {
   try {
-    const scope = req.query.scope || null;
-    const cid   = req.query.classroom_id || null;
-    const isAdmin = req.user.rol === 'admin';
+    const scope  = req.query.scope  || null;
+    const cid    = req.query.classroom_id || null;
+    const status = req.query.status || 'active'; // 'active' | 'approved'
+    const q      = req.query.q?.trim() || null;
 
     // Auto-cerrar polls expiradas
     await db.query(
       `UPDATE polls SET activa=FALSE WHERE activa=TRUE AND fin IS NOT NULL AND fin < NOW()`
     );
 
-    const { rows } = await db.query(`
-      SELECT p.id FROM polls p
-      WHERE (
-        p.activa=TRUE AND p.status='active'
+    let queryText, queryParams;
+    if (status === 'approved') {
+      // Sección "Aprobadas": polls con status='approved'
+      queryText = `
+        SELECT p.id FROM polls p
+        WHERE p.status='approved'
         AND ($1::text IS NULL OR p.scope=$1)
         AND ($2::uuid IS NULL OR p.classroom_id=$2)
-      )
-      ORDER BY
-        CASE WHEN (SELECT rol FROM users WHERE id=p.created_by)='admin'   THEN 0
-             WHEN (SELECT rol FROM users WHERE id=p.created_by)='teacher' THEN 1
-             ELSE 2 END,
-        p.created_at DESC
-    `, [scope, cid]);
+        AND ($3::text IS NULL OR p.titulo ILIKE '%' || $3 || '%' OR p.poll_number::text = LTRIM($3, '#'))
+        ORDER BY p.approved_at DESC NULLS LAST, p.created_at DESC
+      `;
+      queryParams = [scope, cid, q];
+    } else if (status === 'closed') {
+      // Cerradas esperando aprobación (activa=FALSE, status='active')
+      queryText = `
+        SELECT p.id FROM polls p
+        WHERE p.activa=FALSE AND p.status='active'
+        AND ($1::text IS NULL OR p.scope=$1)
+        AND ($2::uuid IS NULL OR p.classroom_id=$2)
+        AND ($3::text IS NULL OR p.titulo ILIKE '%' || $3 || '%' OR p.poll_number::text = LTRIM($3, '#'))
+        ORDER BY p.fin DESC NULLS LAST, p.created_at DESC
+      `;
+      queryParams = [scope, cid, q];
+    } else {
+      // Sección "Activas": polls activas y en curso
+      queryText = `
+        SELECT p.id FROM polls p
+        WHERE p.activa=TRUE AND p.status='active'
+        AND ($1::text IS NULL OR p.scope=$1)
+        AND ($2::uuid IS NULL OR p.classroom_id=$2)
+        AND ($3::text IS NULL OR p.titulo ILIKE '%' || $3 || '%' OR p.poll_number::text = LTRIM($3, '#'))
+        ORDER BY
+          CASE WHEN (SELECT rol FROM users WHERE id=p.created_by)='admin'   THEN 0
+               WHEN (SELECT rol FROM users WHERE id=p.created_by)='teacher' THEN 1
+               ELSE 2 END,
+          p.created_at DESC
+      `;
+      queryParams = [scope, cid, q];
+    }
+
+    const { rows } = await db.query(queryText, queryParams);
     const { rows: qsRows } = await db.query('SELECT * FROM quorum_settings');
     const quorumMap = Object.fromEntries(qsRows.map(r => [r.scope, r]));
-    const enriched = await Promise.all(rows.map(p => enrichPoll(p.id, req.user.id, quorumMap)));
+    const enriched = await Promise.all(rows.map(p => enrichPoll(p.id, req.user.id, quorumMap, req.user.rol)));
     res.json({ ok: true, data: enriched.filter(Boolean) });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// GET /polls/snapshot — datos actuales de la economía (preview al crear propuesta)
+router.get('/snapshot', auth, async (req, res) => {
+  try {
+    const scope = req.query.scope || 'global';
+    const cid   = req.query.classroom_id || null;
+
+    const { rows: coinsRow } = await db.query(`
+      SELECT COALESCE(SUM(le.amount), 0) AS total
+      FROM ledger_entries le
+      JOIN accounts a ON a.id = le.account_id
+      WHERE a.account_type IN ('student','parent') AND a.is_active = TRUE
+    `);
+
+    let votersRow;
+    if (scope === 'aula' && cid) {
+      const { rows } = await db.query(`
+        SELECT COUNT(*)::int AS n FROM classroom_members cm
+        JOIN users u ON u.id = cm.user_id
+        WHERE cm.classroom_id = $1 AND u.rol = 'student'
+      `, [cid]);
+      votersRow = rows;
+    } else {
+      const { rows } = await db.query(
+        `SELECT COUNT(*)::int AS n FROM users WHERE rol IN ('student','parent') AND activo = TRUE`
+      );
+      votersRow = rows;
+    }
+
+    res.json({ ok: true, data: {
+      total_coins:   parseFloat(coinsRow[0].total),
+      total_voters:  parseInt(votersRow[0].n),
+    }});
   } catch (err) {
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }
@@ -180,7 +254,7 @@ router.get('/:id', auth, async (req, res) => {
   try {
     const { rows: qsRows } = await db.query('SELECT * FROM quorum_settings');
     const quorumMap = Object.fromEntries(qsRows.map(r => [r.scope, r]));
-    const data = await enrichPoll(req.params.id, req.user.id, quorumMap);
+    const data = await enrichPoll(req.params.id, req.user.id, quorumMap, req.user.rol);
     if (!data) return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND' } });
     res.json({ ok: true, data });
   } catch (err) {
@@ -221,6 +295,13 @@ router.post('/', auth, async (req, res) => {
     // Alumnos y padres DEBEN describir el contexto
     if (!isStaff && (!contexto?.trim() || contexto.trim().length < 20))
       return res.status(400).json({ ok: false, error: { code: 'INVALID_CONTEXTO', message: 'La descripción del problema debe tener al menos 20 caracteres' } });
+    // Validar duración mínima: global = 24h
+    if (fin) {
+      const durMs  = new Date(fin) - new Date();
+      const minMs  = scope === 'global' ? 24 * 60 * 60 * 1000 : 0;
+      if (durMs < minMs)
+        return res.status(400).json({ ok: false, error: { code: 'TOO_SHORT', message: 'Las votaciones globales deben durar al menos 24 horas' } });
+    }
 
     const activa  = true;   // Todas las propuestas van en vivo directamente (sin pre-aprobación)
     const status  = 'active';
@@ -240,11 +321,32 @@ router.post('/', auth, async (req, res) => {
       finalCid = classroom_id;
     }
 
+    // Capturar snapshot de la economía al momento de crear
+    const { rows: snapCoins } = await db.query(`
+      SELECT COALESCE(SUM(le.amount), 0) AS total
+      FROM ledger_entries le JOIN accounts a ON a.id=le.account_id
+      WHERE a.account_type IN ('student','parent') AND a.is_active=TRUE
+    `);
+    let snapVoters;
+    if (finalScope === 'aula' && finalCid) {
+      const { rows } = await db.query(`
+        SELECT COUNT(*)::int AS n FROM classroom_members cm
+        JOIN users u ON u.id=cm.user_id WHERE cm.classroom_id=$1 AND u.rol='student'
+      `, [finalCid]);
+      snapVoters = parseInt(rows[0].n);
+    } else {
+      const { rows } = await db.query(
+        `SELECT COUNT(*)::int AS n FROM users WHERE rol IN ('student','parent') AND activo=TRUE`
+      );
+      snapVoters = parseInt(rows[0].n);
+    }
+    const snapCoinsVal = parseFloat(snapCoins[0].total);
+
     await client.query('BEGIN');
     const { rows: poll } = await client.query(`
-      INSERT INTO polls (titulo, activa, fin, created_by, scope, classroom_id, weighted, contexto, status)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id
-    `, [titulo.trim(), activa, fin||null, req.user.id, finalScope, finalCid, !!weighted, contexto?.trim()||null, status]);
+      INSERT INTO polls (titulo, activa, fin, created_by, scope, classroom_id, weighted, contexto, status, snapshot_total_coins, snapshot_total_voters)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id
+    `, [titulo.trim(), activa, fin||null, req.user.id, finalScope, finalCid, !!weighted, contexto?.trim()||null, status, snapCoinsVal, snapVoters]);
 
     for (let i = 0; i < opciones.length; i++)
       await client.query('INSERT INTO poll_options (poll_id,texto,orden) VALUES ($1,$2,$3)',
@@ -253,7 +355,7 @@ router.post('/', auth, async (req, res) => {
     await client.query('COMMIT');
     const io = req.app.get('io');
     if (io) io.emit('poll_update', { poll_id: poll[0].id, action: 'created' });
-    const data = await enrichPoll(poll[0].id, req.user.id);
+    const data = await enrichPoll(poll[0].id, req.user.id, null, req.user.rol);
     res.status(201).json({ ok: true, data });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -282,14 +384,21 @@ router.post('/:id/vote', auth, async (req, res) => {
     // Calcular peso del voto (balance actual si es DAO weighted)
     let peso = 1;
     if (poll[0].weighted) {
-      try {
-        const accountId = await balanceSvc.getAccountByUserId(req.user.id);
-        peso = await balanceSvc.getBalance(accountId);
-      } catch(e) {
-        return res.status(400).json({ ok: false, error: { code: 'NO_ACCOUNT', message: 'No tenés cuenta activa' } });
-      }
-      if (peso < 1) {
-        return res.status(400).json({ ok: false, error: { code: 'NO_COINS', message: 'Necesitás al menos 1 moneda para votar en esta propuesta DAO' } });
+      if (req.user.rol === 'admin') {
+        // Admin representa el 3% de las monedas del snapshot
+        const { rows: snapRow } = await db.query('SELECT snapshot_total_coins FROM polls WHERE id=$1', [req.params.id]);
+        peso = parseFloat(snapRow[0]?.snapshot_total_coins || 0) * 0.03;
+        if (peso < 1) peso = 1; // Mínimo 1 aunque no haya snapshot
+      } else {
+        try {
+          const accountId = await balanceSvc.getAccountByUserId(req.user.id);
+          peso = await balanceSvc.getBalance(accountId);
+        } catch(e) {
+          return res.status(400).json({ ok: false, error: { code: 'NO_ACCOUNT', message: 'No tenés cuenta activa' } });
+        }
+        if (peso < 1) {
+          return res.status(400).json({ ok: false, error: { code: 'NO_COINS', message: 'Necesitás al menos 1 moneda para votar en esta propuesta DAO' } });
+        }
       }
     }
 
@@ -306,7 +415,7 @@ router.post('/:id/vote', auth, async (req, res) => {
 
     const { rows: qsRows } = await db.query('SELECT * FROM quorum_settings');
     const quorumMap = Object.fromEntries(qsRows.map(r => [r.scope, r]));
-    const data = await enrichPoll(req.params.id, req.user.id, quorumMap);
+    const data = await enrichPoll(req.params.id, req.user.id, quorumMap, req.user.rol);
     res.json({ ok: true, data });
   } catch (err) {
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
@@ -331,7 +440,29 @@ router.patch('/:id/review', auth, roles('admin'), async (req, res) => {
     }
     const { rows: qsRows } = await db.query('SELECT * FROM quorum_settings');
     const quorumMap = Object.fromEntries(qsRows.map(r => [r.scope, r]));
-    const data = await enrichPoll(req.params.id, req.user.id, quorumMap);
+    const data = await enrichPoll(req.params.id, req.user.id, quorumMap, req.user.rol);
+    res.json({ ok: true, data });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// PATCH /polls/:id/approve — admin aprueba oficialmente una votación cerrada
+router.patch('/:id/approve', auth, roles('admin'), async (req, res) => {
+  try {
+    const { rows: poll } = await db.query('SELECT id, status FROM polls WHERE id=$1', [req.params.id]);
+    if (!poll.length) return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND' } });
+    if (poll[0].status === 'approved')
+      return res.status(409).json({ ok: false, error: { code: 'ALREADY_APPROVED' } });
+    await db.query(
+      `UPDATE polls SET status='approved', approved_at=NOW(), approved_by=$1 WHERE id=$2`,
+      [req.user.id, req.params.id]
+    );
+    const io = req.app.get('io');
+    if (io) io.emit('poll_update', { poll_id: req.params.id, action: 'approved' });
+    const { rows: qsRows } = await db.query('SELECT * FROM quorum_settings');
+    const quorumMap = Object.fromEntries(qsRows.map(r => [r.scope, r]));
+    const data = await enrichPoll(req.params.id, req.user.id, quorumMap, req.user.rol);
     res.json({ ok: true, data });
   } catch (err) {
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
@@ -368,7 +499,7 @@ router.patch('/:id', auth, async (req, res) => {
         return res.status(403).json({ ok: false, error: { code: 'FORBIDDEN', message: 'Solo podés cerrar tus propias votaciones' } });
     }
     await db.query('UPDATE polls SET activa=$1 WHERE id=$2', [activa, req.params.id]);
-    const data = await enrichPoll(req.params.id, req.user.id);
+    const data = await enrichPoll(req.params.id, req.user.id, null, req.user.rol);
     res.json({ ok: true, data });
   } catch (err) {
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
@@ -393,7 +524,7 @@ router.post('/:id/react', auth, async (req, res) => {
       await db.query('INSERT INTO poll_reactions (poll_id,user_id,tipo) VALUES ($1,$2,$3)',
         [req.params.id, req.user.id, tipo]);
 
-    const data = await enrichPoll(req.params.id, req.user.id);
+    const data = await enrichPoll(req.params.id, req.user.id, null, req.user.rol);
     res.json({ ok: true, data });
   } catch (err) {
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
