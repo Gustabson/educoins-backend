@@ -1,10 +1,33 @@
-// src/routes/polls.js — version completa con scope, likes, comentarios, DAO weighted voting
+// src/routes/polls.js — DAO weighted voting, inicio programado, snapshot automático
 const express    = require('express');
 const router     = express.Router();
 const db         = require('../config/db');
 const auth       = require('../middleware/auth');
 const roles      = require('../middleware/roles');
 const balanceSvc = require('../services/balance');
+
+// ── Helper: tomar snapshot de la economía ─────────────────────
+async function takeSnapshot(scope, classroom_id) {
+  const { rows: c } = await db.query(`
+    SELECT COALESCE(SUM(le.amount),0) AS total
+    FROM ledger_entries le JOIN accounts a ON a.id=le.account_id
+    WHERE a.account_type IN ('student','parent') AND a.is_active=TRUE
+  `);
+  let total_voters;
+  if (scope === 'aula' && classroom_id) {
+    const { rows } = await db.query(`
+      SELECT COUNT(*)::int AS n FROM classroom_members cm
+      JOIN users u ON u.id=cm.user_id WHERE cm.classroom_id=$1 AND u.rol='student'
+    `, [classroom_id]);
+    total_voters = parseInt(rows[0].n);
+  } else {
+    const { rows } = await db.query(
+      `SELECT COUNT(*)::int AS n FROM users WHERE rol IN ('student','parent') AND activo=TRUE`
+    );
+    total_voters = parseInt(rows[0].n);
+  }
+  return { total_coins: parseFloat(c[0].total), total_voters };
+}
 
 // ── Quórum ────────────────────────────────────────────────────
 async function calculateQuorum(pollId, poll, options, qs) {
@@ -66,7 +89,7 @@ async function enrichPoll(pollId, userId, quorumMap, userRole) {
            p.status, p.contexto, p.review_note,
            p.poll_number,
            p.snapshot_total_coins, p.snapshot_total_voters,
-           p.approved_at,
+           p.inicio, p.approved_at,
            p.created_by AS creador_id,
            u.nombre AS creador_nombre, u.rol AS creador_rol
     FROM polls p JOIN users u ON u.id = p.created_by
@@ -144,6 +167,24 @@ router.get('/', auth, async (req, res) => {
       `UPDATE polls SET activa=FALSE WHERE activa=TRUE AND fin IS NOT NULL AND fin < NOW()`
     );
 
+    // Auto-abrir polls programadas cuyo inicio ya llegó (y tomar snapshot)
+    const { rows: toOpen } = await db.query(`
+      SELECT id, scope, classroom_id FROM polls
+      WHERE activa=FALSE AND status='active'
+      AND inicio IS NOT NULL AND inicio <= NOW()
+      AND (fin IS NULL OR fin > NOW())
+      AND snapshot_total_coins = 0
+    `);
+    for (const p of toOpen) {
+      const snap = await takeSnapshot(p.scope, p.classroom_id);
+      await db.query(
+        `UPDATE polls SET activa=TRUE, snapshot_total_coins=$1, snapshot_total_voters=$2 WHERE id=$3`,
+        [snap.total_coins, snap.total_voters, p.id]
+      );
+      const ioInst = req.app.get('io');
+      if (ioInst) ioInst.emit('poll_update', { poll_id: p.id, action: 'created' });
+    }
+
     let queryText, queryParams;
     if (status === 'approved') {
       // Sección "Aprobadas": polls con status='approved'
@@ -168,14 +209,19 @@ router.get('/', auth, async (req, res) => {
       `;
       queryParams = [scope, cid, q];
     } else {
-      // Sección "Activas": polls activas y en curso
+      // Sección "Activas": polls activas + upcoming (inicio futuro, aún no arrancaron)
       queryText = `
         SELECT p.id FROM polls p
-        WHERE p.activa=TRUE AND p.status='active'
+        WHERE p.status='active'
+        AND (
+          p.activa=TRUE
+          OR (p.activa=FALSE AND p.inicio IS NOT NULL AND p.inicio > NOW() AND (p.fin IS NULL OR p.fin > NOW()))
+        )
         AND ($1::text IS NULL OR p.scope=$1)
         AND ($2::uuid IS NULL OR p.classroom_id=$2)
         AND ($3::text IS NULL OR p.titulo ILIKE '%' || $3 || '%' OR p.poll_number::text = LTRIM($3, '#'))
         ORDER BY
+          CASE WHEN p.activa=FALSE THEN 0 ELSE 1 END,  -- upcoming primero dentro de cada jerarquía
           CASE WHEN (SELECT rol FROM users WHERE id=p.created_by)='admin'   THEN 0
                WHEN (SELECT rol FROM users WHERE id=p.created_by)='teacher' THEN 1
                ELSE 2 END,
@@ -199,33 +245,8 @@ router.get('/snapshot', auth, async (req, res) => {
   try {
     const scope = req.query.scope || 'global';
     const cid   = req.query.classroom_id || null;
-
-    const { rows: coinsRow } = await db.query(`
-      SELECT COALESCE(SUM(le.amount), 0) AS total
-      FROM ledger_entries le
-      JOIN accounts a ON a.id = le.account_id
-      WHERE a.account_type IN ('student','parent') AND a.is_active = TRUE
-    `);
-
-    let votersRow;
-    if (scope === 'aula' && cid) {
-      const { rows } = await db.query(`
-        SELECT COUNT(*)::int AS n FROM classroom_members cm
-        JOIN users u ON u.id = cm.user_id
-        WHERE cm.classroom_id = $1 AND u.rol = 'student'
-      `, [cid]);
-      votersRow = rows;
-    } else {
-      const { rows } = await db.query(
-        `SELECT COUNT(*)::int AS n FROM users WHERE rol IN ('student','parent') AND activo = TRUE`
-      );
-      votersRow = rows;
-    }
-
-    res.json({ ok: true, data: {
-      total_coins:   parseFloat(coinsRow[0].total),
-      total_voters:  parseInt(votersRow[0].n),
-    }});
+    const snap  = await takeSnapshot(scope, cid);
+    res.json({ ok: true, data: snap });
   } catch (err) {
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }
@@ -281,30 +302,29 @@ router.get('/:id/voters', auth, async (req, res) => {
   }
 });
 
-// POST /polls — abierto a todos; staff publica directo, otros pasan por revisión
+// POST /polls — siempre DAO weighted; inicio programado con snapshot automático
 router.post('/', auth, async (req, res) => {
   const client = await db.getClient();
   try {
-    const { titulo, opciones, fin, scope='global', classroom_id=null, weighted=false, contexto='' } = req.body;
-    const isStaff = ['admin','teacher'].includes(req.user.rol);
+    const { titulo, opciones, inicio: inicioRaw, fin, scope='global', classroom_id=null, contexto='' } = req.body;
+    const isStaff    = ['admin','teacher'].includes(req.user.rol);
+    const weighted   = true;   // Siempre DAO ponderado por monedas
 
     if (!titulo?.trim() || titulo.trim().length < 5)
       return res.status(400).json({ ok: false, error: { code: 'INVALID_TITULO', message: 'El título debe tener al menos 5 caracteres' } });
     if (!Array.isArray(opciones) || opciones.length < 2 || opciones.length > 8)
       return res.status(400).json({ ok: false, error: { code: 'INVALID_OPTIONS' } });
-    // Alumnos y padres DEBEN describir el contexto
     if (!isStaff && (!contexto?.trim() || contexto.trim().length < 20))
       return res.status(400).json({ ok: false, error: { code: 'INVALID_CONTEXTO', message: 'La descripción del problema debe tener al menos 20 caracteres' } });
-    // Validar duración mínima: global = 24h
-    if (fin) {
-      const durMs  = new Date(fin) - new Date();
-      const minMs  = scope === 'global' ? 24 * 60 * 60 * 1000 : 0;
-      if (durMs < minMs)
-        return res.status(400).json({ ok: false, error: { code: 'TOO_SHORT', message: 'Las votaciones globales deben durar al menos 24 horas' } });
+
+    // Validar inicio programado
+    const inicioDate = inicioRaw ? new Date(inicioRaw) : null;
+    if (scope === 'global') {
+      const minInicio = new Date(Date.now() + 24 * 60 * 60 * 1000);
+      if (!inicioDate || inicioDate < minInicio)
+        return res.status(400).json({ ok: false, error: { code: 'TOO_EARLY', message: 'Las votaciones globales deben comenzar al menos 24 horas después de ser creadas' } });
     }
 
-    const activa  = true;   // Todas las propuestas van en vivo directamente (sin pre-aprobación)
-    const status  = 'active';
     const finalScope = scope || 'global';
     let   finalCid   = null;
     if (finalScope === 'aula') {
@@ -321,32 +341,22 @@ router.post('/', auth, async (req, res) => {
       finalCid = classroom_id;
     }
 
-    // Capturar snapshot de la economía al momento de crear
-    const { rows: snapCoins } = await db.query(`
-      SELECT COALESCE(SUM(le.amount), 0) AS total
-      FROM ledger_entries le JOIN accounts a ON a.id=le.account_id
-      WHERE a.account_type IN ('student','parent') AND a.is_active=TRUE
-    `);
-    let snapVoters;
-    if (finalScope === 'aula' && finalCid) {
-      const { rows } = await db.query(`
-        SELECT COUNT(*)::int AS n FROM classroom_members cm
-        JOIN users u ON u.id=cm.user_id WHERE cm.classroom_id=$1 AND u.rol='student'
-      `, [finalCid]);
-      snapVoters = parseInt(rows[0].n);
-    } else {
-      const { rows } = await db.query(
-        `SELECT COUNT(*)::int AS n FROM users WHERE rol IN ('student','parent') AND activo=TRUE`
-      );
-      snapVoters = parseInt(rows[0].n);
+    // Si inicio es en el futuro: activa=false y snapshot se tomará al abrir
+    // Si inicio es ahora o null: activa=true y snapshot se toma ahora
+    const inmediato = !inicioDate || inicioDate <= new Date();
+    const activa    = inmediato;
+    let snapCoinsVal = 0, snapVoters = 0;
+    if (inmediato) {
+      const snap = await takeSnapshot(finalScope, finalCid);
+      snapCoinsVal = snap.total_coins;
+      snapVoters   = snap.total_voters;
     }
-    const snapCoinsVal = parseFloat(snapCoins[0].total);
 
     await client.query('BEGIN');
     const { rows: poll } = await client.query(`
-      INSERT INTO polls (titulo, activa, fin, created_by, scope, classroom_id, weighted, contexto, status, snapshot_total_coins, snapshot_total_voters)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id
-    `, [titulo.trim(), activa, fin||null, req.user.id, finalScope, finalCid, !!weighted, contexto?.trim()||null, status, snapCoinsVal, snapVoters]);
+      INSERT INTO polls (titulo, activa, inicio, fin, created_by, scope, classroom_id, weighted, contexto, status, snapshot_total_coins, snapshot_total_voters)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id
+    `, [titulo.trim(), activa, inicioDate||null, fin||null, req.user.id, finalScope, finalCid, weighted, contexto?.trim()||null, 'active', snapCoinsVal, snapVoters]);
 
     for (let i = 0; i < opciones.length; i++)
       await client.query('INSERT INTO poll_options (poll_id,texto,orden) VALUES ($1,$2,$3)',
@@ -354,7 +364,7 @@ router.post('/', auth, async (req, res) => {
 
     await client.query('COMMIT');
     const io = req.app.get('io');
-    if (io) io.emit('poll_update', { poll_id: poll[0].id, action: 'created' });
+    if (io) io.emit('poll_update', { poll_id: poll[0].id, action: inmediato ? 'created' : 'scheduled' });
     const data = await enrichPoll(poll[0].id, req.user.id, null, req.user.rol);
     res.status(201).json({ ok: true, data });
   } catch (err) {
@@ -369,12 +379,23 @@ router.post('/:id/vote', auth, async (req, res) => {
     const { option_id } = req.body;
     if (!option_id) return res.status(400).json({ ok: false, error: { code: 'INVALID_OPTION' } });
 
-    const { rows: poll } = await db.query('SELECT activa, fin, weighted FROM polls WHERE id=$1', [req.params.id]);
+    const { rows: poll } = await db.query(
+      'SELECT activa, fin, weighted, inicio, scope, classroom_id, snapshot_total_coins FROM polls WHERE id=$1',
+      [req.params.id]
+    );
     if (!poll.length) return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND' } });
     if (!poll[0].activa) return res.status(400).json({ ok: false, error: { code: 'POLL_CLOSED' } });
-    if (poll[0].fin) {
-      if (new Date(poll[0].fin) < new Date())
-        return res.status(400).json({ ok: false, error: { code: 'POLL_EXPIRED', message: 'Esta votación ya venció' } });
+    if (poll[0].inicio && new Date(poll[0].inicio) > new Date())
+      return res.status(400).json({ ok: false, error: { code: 'NOT_STARTED', message: 'Esta votación aún no comenzó' } });
+    if (poll[0].fin && new Date(poll[0].fin) < new Date())
+      return res.status(400).json({ ok: false, error: { code: 'POLL_EXPIRED', message: 'Esta votación ya venció' } });
+
+    // Lazy snapshot: si aún no se tomó (poll inmediata sin snapshot), tomarlo ahora
+    if (poll[0].weighted && parseFloat(poll[0].snapshot_total_coins) === 0) {
+      const snap = await takeSnapshot(poll[0].scope, poll[0].classroom_id);
+      await db.query('UPDATE polls SET snapshot_total_coins=$1, snapshot_total_voters=$2 WHERE id=$3',
+        [snap.total_coins, snap.total_voters, req.params.id]);
+      poll[0].snapshot_total_coins = snap.total_coins;
     }
 
     const { rows: opt } = await db.query(
