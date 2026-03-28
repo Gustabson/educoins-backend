@@ -135,26 +135,19 @@ router.get('/', auth, async (req, res) => {
       `UPDATE polls SET activa=FALSE WHERE activa=TRUE AND fin IS NOT NULL AND fin < NOW()`
     );
 
-    // Admin ve todo activo + pendientes de todos; el resto ve activos + los propios
-    const adminClause = isAdmin ? "OR p.status='pending'" : "";
     const { rows } = await db.query(`
       SELECT p.id FROM polls p
       WHERE (
-        (p.activa=TRUE AND p.status='active'
-         AND ($1::text IS NULL OR p.scope=$1)
-         AND ($2::uuid IS NULL OR p.classroom_id=$2))
-        OR (p.created_by=$3 AND p.status IN ('pending','rejected'))
-        ${adminClause}
+        p.activa=TRUE AND p.status='active'
+        AND ($1::text IS NULL OR p.scope=$1)
+        AND ($2::uuid IS NULL OR p.classroom_id=$2)
       )
       ORDER BY
-        CASE WHEN p.status='pending'  THEN 0
-             WHEN p.status='rejected' THEN 3
-             ELSE 1 END,
         CASE WHEN (SELECT rol FROM users WHERE id=p.created_by)='admin'   THEN 0
              WHEN (SELECT rol FROM users WHERE id=p.created_by)='teacher' THEN 1
              ELSE 2 END,
         p.created_at DESC
-    `, [scope, cid, req.user.id]);
+    `, [scope, cid]);
     const { rows: qsRows } = await db.query('SELECT * FROM quorum_settings');
     const quorumMap = Object.fromEntries(qsRows.map(r => [r.scope, r]));
     const enriched = await Promise.all(rows.map(p => enrichPoll(p.id, req.user.id, quorumMap)));
@@ -229,8 +222,8 @@ router.post('/', auth, async (req, res) => {
     if (!isStaff && (!contexto?.trim() || contexto.trim().length < 20))
       return res.status(400).json({ ok: false, error: { code: 'INVALID_CONTEXTO', message: 'La descripción del problema debe tener al menos 20 caracteres' } });
 
-    const activa  = isStaff;
-    const status  = isStaff ? 'active' : 'pending';
+    const activa  = true;   // Todas las propuestas van en vivo directamente (sin pre-aprobación)
+    const status  = 'active';
     const finalScope = scope || 'global';
     let   finalCid   = null;
     if (finalScope === 'aula') {
@@ -258,10 +251,8 @@ router.post('/', auth, async (req, res) => {
         [poll[0].id, opciones[i].trim(), i]);
 
     await client.query('COMMIT');
-    if (activa) {
-      const io = req.app.get('io');
-      if (io) io.emit('poll_update', { poll_id: poll[0].id, action: 'created' });
-    }
+    const io = req.app.get('io');
+    if (io) io.emit('poll_update', { poll_id: poll[0].id, action: 'created' });
     const data = await enrichPoll(poll[0].id, req.user.id);
     res.status(201).json({ ok: true, data });
   } catch (err) {
