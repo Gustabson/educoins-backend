@@ -182,17 +182,6 @@ router.get('/pending', auth, roles('admin'), async (req, res) => {
   }
 });
 
-// GET /polls/:id
-router.get('/:id', auth, async (req, res) => {
-  try {
-    const data = await enrichPoll(req.params.id, req.user.id);
-    if (!data) return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND' } });
-    res.json({ ok: true, data });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
-  }
-});
-
 // GET /polls/:id — una sola poll con quórum actualizado
 router.get('/:id', auth, async (req, res) => {
   try {
@@ -242,8 +231,21 @@ router.post('/', auth, async (req, res) => {
 
     const activa  = isStaff;
     const status  = isStaff ? 'active' : 'pending';
-    const finalScope = isStaff ? scope : 'global';
-    const finalCid   = isStaff ? classroom_id : null;
+    const finalScope = scope || 'global';
+    let   finalCid   = null;
+    if (finalScope === 'aula') {
+      if (!classroom_id)
+        return res.status(400).json({ ok: false, error: { code: 'MISSING_CLASSROOM', message: 'Indicá el aula' } });
+      if (!isStaff) {
+        const { rows: mem } = await db.query(
+          'SELECT 1 FROM classroom_members WHERE classroom_id=$1 AND user_id=$2',
+          [classroom_id, req.user.id]
+        );
+        if (!mem.length)
+          return res.status(403).json({ ok: false, error: { code: 'NOT_IN_CLASSROOM', message: 'No sos miembro de ese aula' } });
+      }
+      finalCid = classroom_id;
+    }
 
     await client.query('BEGIN');
     const { rows: poll } = await client.query(`
@@ -453,6 +455,8 @@ router.post('/:id/comments', auth, async (req, res) => {
     const { rows } = await db.query(`
       INSERT INTO poll_comments (poll_id,user_id,parent_id,texto) VALUES ($1,$2,$3,$4) RETURNING id,texto,created_at,parent_id
     `, [req.params.id, req.user.id, parent_id, texto.trim()]);
+    const io = req.app.get('io');
+    if (io) io.emit('poll_update', { poll_id: req.params.id, action: 'comment' });
     res.status(201).json({ ok: true, data: { ...rows[0], user_id:req.user.id, nombre:req.user.nombre, rol:req.user.rol, likes:0, dislikes:0, mi_reaccion:null, respuestas:0 } });
   } catch (err) {
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
