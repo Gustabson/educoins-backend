@@ -35,7 +35,7 @@ async function calculateQuorum(pollId, poll, options, qs) {
     current = total_peso;
     if (poll.scope === 'aula' && poll.classroom_id) {
       const { rows } = await db.query(`
-        SELECT COALESCE(SUM(CASE WHEN le.type='credit' THEN le.amount ELSE -le.amount END),0) AS total
+        SELECT COALESCE(SUM(le.amount), 0) AS total
         FROM ledger_entries le
         JOIN accounts a ON a.id=le.account_id
         JOIN classroom_members cm ON cm.user_id=a.user_id AND cm.classroom_id=$1
@@ -44,7 +44,7 @@ async function calculateQuorum(pollId, poll, options, qs) {
       eligible = parseFloat(rows[0].total);
     } else {
       const { rows } = await db.query(`
-        SELECT COALESCE(SUM(CASE WHEN le.type='credit' THEN le.amount ELSE -le.amount END),0) AS total
+        SELECT COALESCE(SUM(le.amount), 0) AS total
         FROM ledger_entries le
         JOIN accounts a ON a.id=le.account_id
         WHERE a.account_type IN ('student','parent') AND a.is_active=TRUE
