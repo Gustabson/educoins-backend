@@ -23,7 +23,7 @@ router.post('/login', async (req, res) => {
 
     // Buscar usuario por email
     const { rows } = await db.query(
-      'SELECT id, email, password_hash, nombre, rol, activo, skin, border, title FROM users WHERE email = $1',
+      'SELECT id, email, password_hash, nombre, rol, activo, skin, border, title, permisos FROM users WHERE email = $1',
       [email.toLowerCase().trim()]
     );
 
@@ -71,13 +71,14 @@ router.post('/login', async (req, res) => {
       data: {
         token,
         user: {
-          id:     user.id,
-          nombre: user.nombre,
-          email:  user.email,
-          rol:    user.rol,
-          skin:   user.skin,
-          border: user.border,
-          title:  user.title,
+          id:       user.id,
+          nombre:   user.nombre,
+          email:    user.email,
+          rol:      user.rol,
+          skin:     user.skin,
+          border:   user.border,
+          title:    user.title,
+          permisos: user.permisos || [],
           account_id: accountId,
         }
       }
@@ -93,7 +94,8 @@ router.get('/me', auth, async (req, res) => {
   try {
     const { rows } = await db.query(
       `SELECT id, email, nombre, apodo, alias, rol, skin, border, title,
-              unlocked_skins, unlocked_borders, unlocked_titles, unlocked_avatar_bgs, total_earned, estado, active_titles, avatar_bg
+              unlocked_skins, unlocked_borders, unlocked_titles, unlocked_avatar_bgs,
+              total_earned, estado, active_titles, avatar_bg, permisos
        FROM users WHERE id = $1`,
       [req.user.id]
     );

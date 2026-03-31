@@ -12,11 +12,30 @@ const router = express.Router();
 // Todos los endpoints de admin requieren autenticación y rol admin
 router.use(auth, roles('admin'));
 
+// ── Migraciones ───────────────────────────────────────────────
+db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS permisos TEXT[] DEFAULT '{}'`)
+  .catch(e => console.warn('[admin] permisos column:', e.message));
+
+db.query(`
+  CREATE TABLE IF NOT EXISTS admin_proposals (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    from_user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    seccion      TEXT NOT NULL,
+    titulo       TEXT NOT NULL,
+    descripcion  TEXT NOT NULL,
+    estado       TEXT NOT NULL DEFAULT 'pending',
+    respuesta    TEXT,
+    created_at   TIMESTAMPTZ DEFAULT NOW(),
+    resolved_at  TIMESTAMPTZ,
+    resolved_by  UUID REFERENCES users(id)
+  )
+`).catch(e => console.warn('[admin] admin_proposals table:', e.message));
+
 // ── GET /api/v1/admin/users ───────────────────────────────────
 router.get('/users', async (req, res) => {
   try {
     const { rows } = await db.query(
-      'SELECT id, nombre, email, rol, activo, total_earned, created_at FROM users ORDER BY created_at DESC'
+      'SELECT id, nombre, email, rol, permisos, activo, total_earned, created_at FROM users ORDER BY created_at DESC'
     );
     res.json({ ok: true, data: rows });
   } catch (err) {
@@ -28,10 +47,17 @@ router.get('/users', async (req, res) => {
 router.post('/users', async (req, res) => {
   const client = await db.getClient();
   try {
-    const { nombre, email, password, rol } = req.body;
+    const { nombre, email, password, rol, permisos } = req.body;
     if (!nombre || !email || !password || !rol) {
       return res.status(400).json({ ok: false, error: { code: 'MISSING_FIELDS', message: 'Todos los campos son requeridos' } });
     }
+
+    const validRoles = ['student','teacher','parent','staff','admin'];
+    if (!validRoles.includes(rol)) {
+      return res.status(400).json({ ok: false, error: { code: 'INVALID_ROL', message: `Rol inválido. Válidos: ${validRoles.join(', ')}` } });
+    }
+
+    const permisosFinal = Array.isArray(permisos) ? permisos : [];
 
     await client.query('BEGIN');
 
@@ -39,13 +65,13 @@ router.post('/users', async (req, res) => {
     const userId = uuidv4();
 
     const { rows } = await client.query(
-      `INSERT INTO users (id, nombre, email, password_hash, rol)
-       VALUES ($1,$2,$3,$4,$5) RETURNING id, nombre, email, rol`,
-      [userId, nombre, email.toLowerCase().trim(), password_hash, rol]
+      `INSERT INTO users (id, nombre, email, password_hash, rol, permisos)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, nombre, email, rol, permisos`,
+      [userId, nombre, email.toLowerCase().trim(), password_hash, rol, permisosFinal]
     );
 
     // Crear cuenta automáticamente para el usuario
-    const accountTypeMap = { student: 'student', teacher: 'teacher', parent: 'parent' };
+    const accountTypeMap = { student: 'student', teacher: 'teacher', parent: 'parent', staff: 'teacher' };
     if (accountTypeMap[rol]) {
       await client.query(
         `INSERT INTO accounts (id, user_id, account_type, label)
@@ -646,6 +672,67 @@ router.get('/parent-links', async (req, res) => {
       ORDER BY p.nombre, s.nombre
     `);
     res.json({ ok: true, data: rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// ── PATCH /admin/users/:id/permisos ──────────────────────────
+// Actualiza los permisos de un usuario (solo superadmin)
+router.patch('/users/:id/permisos', async (req, res) => {
+  try {
+    const { permisos } = req.body;
+    if (!Array.isArray(permisos)) {
+      return res.status(400).json({ ok: false, error: { code: 'INVALID_PERMISOS', message: 'permisos debe ser un array' } });
+    }
+    const { rows } = await db.query(
+      `UPDATE users SET permisos=$1 WHERE id=$2 RETURNING id, nombre, rol, permisos`,
+      [permisos, req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND' } });
+    res.json({ ok: true, data: rows[0] });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+// SOLICITUDES — staff propone cambios, superadmin aprueba
+// ══════════════════════════════════════════════════════════════
+
+// GET  /admin/proposals        → lista todas (superadmin)
+router.get('/proposals', async (req, res) => {
+  try {
+    const { rows } = await db.query(`
+      SELECT p.*, u.nombre AS from_nombre, u.rol AS from_rol, u.permisos AS from_permisos,
+             r.nombre AS resolved_nombre
+      FROM admin_proposals p
+      JOIN users u ON u.id = p.from_user_id
+      LEFT JOIN users r ON r.id = p.resolved_by
+      ORDER BY p.created_at DESC
+    `);
+    res.json({ ok: true, data: rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// PATCH /admin/proposals/:id  → aprobar o rechazar (superadmin)
+router.patch('/proposals/:id', async (req, res) => {
+  try {
+    const { estado, respuesta } = req.body;
+    if (!['approved','rejected'].includes(estado)) {
+      return res.status(400).json({ ok: false, error: { code: 'INVALID_ESTADO' } });
+    }
+    const { rows } = await db.query(
+      `UPDATE admin_proposals
+       SET estado=$1, respuesta=$2, resolved_at=NOW(), resolved_by=$3
+       WHERE id=$4
+       RETURNING *`,
+      [estado, respuesta||null, req.user.id, req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND' } });
+    res.json({ ok: true, data: rows[0] });
   } catch (err) {
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }

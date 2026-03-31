@@ -33,7 +33,7 @@ async function auth(req, res, next) {
     // 3. Verificar que el usuario siga activo en la BD
     // (el admin puede desactivar una cuenta y el token existente queda inválido)
     const { rows } = await db.query(
-      'SELECT id, rol, nombre, activo FROM users WHERE id = $1',
+      'SELECT id, rol, nombre, activo, permisos FROM users WHERE id = $1',
       [payload.sub]
     );
 
@@ -50,6 +50,7 @@ async function auth(req, res, next) {
       rol:        rows[0].rol,
       nombre:     rows[0].nombre,
       account_id: payload.account_id,
+      permisos:   rows[0].permisos || [],
     };
 
     next();
