@@ -581,6 +581,8 @@ router.post('/:id/react', auth, async (req, res) => {
       await db.query('INSERT INTO poll_reactions (poll_id,user_id,tipo) VALUES ($1,$2,$3)',
         [req.params.id, req.user.id, tipo]);
 
+    const io = req.app.get('io');
+    if (io) io.emit('poll_update', { poll_id: req.params.id, action: 'reaction' });
     const data = await enrichPoll(req.params.id, req.user.id, null, req.user.rol);
     res.json({ ok: true, data });
   } catch (err) {
@@ -668,6 +670,8 @@ router.post('/:id/comments/:cid/react', auth, async (req, res) => {
         (SELECT tipo FROM poll_comment_reactions WHERE comment_id=$1 AND user_id=$2)              AS mi_reaccion
     `, [req.params.cid, req.user.id]);
 
+    const io = req.app.get('io');
+    if (io) io.emit('poll_update', { poll_id: req.params.id, action: 'comment_react', comment_id: req.params.cid });
     res.json({ ok: true, data: { comment_id: req.params.cid, ...counts[0] } });
   } catch (err) {
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
