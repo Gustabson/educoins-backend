@@ -13,6 +13,7 @@ const roles   = require('../middleware/roles');
 const { getAccountByUserId } = require('../services/balance');
 const { getIO } = require('../socket');
 const { v4: uuidv4 } = require('uuid');
+const crypto  = require('crypto');
 
 const COINS = 3;
 const TZ    = 'America/Argentina/Buenos_Aires';
@@ -125,8 +126,8 @@ router.post('/checkin', auth, async (req, res) => {
     // Guardar nota en historial independiente (siempre que no esté vacía)
     if (nota) {
       await db.query(
-        `INSERT INTO wellness_notes (user_id, mood, categories, nota) VALUES ($1, $2, $3, $4)`,
-        [req.user.id, mood, categories, nota]
+        `INSERT INTO wellness_notes (id, user_id, mood, categories, nota) VALUES ($1, $2, $3, $4, $5)`,
+        [uuidv4(), req.user.id, mood, categories, nota]
       ).catch(() => {});
     }
 
@@ -282,7 +283,7 @@ const DEFAULT_CFG = {
 // ── Crear tablas si no existen ───────────────────────────────
 db.query(`
   CREATE TABLE IF NOT EXISTS wellness_notes (
-    id         UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    id         UUID PRIMARY KEY,
     user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     mood       INT,
     categories JSONB DEFAULT '[]',
@@ -290,6 +291,20 @@ db.query(`
     created_at TIMESTAMPTZ DEFAULT NOW()
   )
 `).catch(e => console.warn('[wellness_notes]', e.message));
+
+db.query(`
+  CREATE TABLE IF NOT EXISTS wellness_backups (
+    id          UUID PRIMARY KEY,
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    period_days INT NOT NULL,
+    record_count INT NOT NULL,
+    size_bytes  INT NOT NULL,
+    encrypted_data TEXT NOT NULL,
+    iv          TEXT NOT NULL,
+    auth_tag    TEXT NOT NULL,
+    checksum    TEXT NOT NULL
+  )
+`).catch(e => console.warn('[wellness_backups]', e.message));
 
 db.query(`
   CREATE TABLE IF NOT EXISTS wellness_config (
@@ -508,8 +523,9 @@ router.get('/admin/students', auth, roles('admin', 'teacher'), async (req, res) 
 // ── GET /wellness/admin/student/:userId ──────────────────────
 router.get('/admin/student/:userId', auth, roles('admin', 'teacher'), async (req, res) => {
   try {
-    const cfg = await getWellnessCfg();
-    const uid = req.params.userId;
+    const cfg  = await getWellnessCfg();
+    const uid  = req.params.userId;
+    const days = Math.min(730, Math.max(7, parseInt(req.query.days) || 30));
 
     const [stRes, entRes, notesRes, repRes, unreadRes] = await Promise.all([
       db.query(`SELECT id, nombre, curso, avatar_bg FROM users WHERE id = $1`, [uid]),
@@ -530,9 +546,9 @@ router.get('/admin/student/:userId', auth, roles('admin', 'teacher'), async (req
                 created_at
          FROM wellness_notes
          WHERE user_id = $1
-           AND created_at >= NOW() - INTERVAL '20 days'
+           AND created_at >= NOW() - ($4 || ' days')::INTERVAL
          ORDER BY created_at DESC`,
-        [uid, !!cfg.show_notas, TZ]
+        [uid, !!cfg.show_notas, TZ, days]
       ),
       db.query(
         `SELECT id, tipo, descripcion, is_anonymous, reviewed, reviewed_at, created_at
@@ -564,9 +580,9 @@ router.get('/admin/student/:userId', auth, roles('admin', 'teacher'), async (req
 router.get('/admin/explore', auth, roles('admin', 'teacher'), async (req, res) => {
   try {
     const cfg    = await getWellnessCfg();
-    const period = req.query.period || 'today';
+    const days   = Math.min(730, Math.max(1, parseInt(req.query.days) || 30));
     const today  = todayAR();
-    const since  = period === 'week' ? daysAgoAR(7) : today;
+    const since  = daysAgoAR(days - 1);
 
     const [stRes, entRes, notesRes] = await Promise.all([
       db.query(
@@ -586,12 +602,12 @@ router.get('/admin/explore', auth, roles('admin', 'teacher'), async (req, res) =
         `SELECT user_id,
                 CASE WHEN $2 THEN nota ELSE NULL END AS nota,
                 mood, categories,
-                DATE(created_at AT TIME ZONE $3)::text    AS date,
+                DATE(created_at AT TIME ZONE $3)::text        AS date,
                 TO_CHAR(created_at AT TIME ZONE $3, 'HH24:MI') AS time
          FROM wellness_notes
-         WHERE DATE(created_at AT TIME ZONE $3) >= $1::date
+         WHERE created_at >= NOW() - ($4 || ' days')::INTERVAL
          ORDER BY created_at DESC`,
-        [since, !!cfg.show_notas, TZ]
+        [since, !!cfg.show_notas, TZ, days]
       ),
     ]);
 
@@ -646,5 +662,152 @@ router.put('/admin/config', auth, roles('admin'), async (req, res) => {
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }
 });
+
+// ══════════════════════════════════════════════════════════════
+// BACKUPS CIFRADOS — AES-256-GCM
+// ══════════════════════════════════════════════════════════════
+
+function getBackupKey() {
+  const secret = process.env.JWT_SECRET || process.env.BACKUP_KEY || 'wellness_backup_default_key_change_in_prod';
+  return crypto.createHash('sha256').update(secret + ':wellness_backup').digest();
+}
+
+async function runBackup(periodDays = 730) {
+  const [entries, notes, reports] = await Promise.all([
+    db.query(`SELECT me.id, me.user_id, u.nombre, me.mood, me.categories,
+                     DATE(me.created_at AT TIME ZONE $2)::text AS date, me.created_at
+              FROM mood_entries me JOIN users u ON u.id=me.user_id
+              WHERE me.created_at >= NOW() - ($1 || ' days')::INTERVAL
+              ORDER BY me.created_at DESC`, [periodDays, TZ]),
+    db.query(`SELECT wn.id, wn.user_id, u.nombre, wn.mood, wn.categories, wn.nota,
+                     DATE(wn.created_at AT TIME ZONE $2)::text AS date,
+                     TO_CHAR(wn.created_at AT TIME ZONE $2, 'HH24:MI') AS time, wn.created_at
+              FROM wellness_notes wn JOIN users u ON u.id=wn.user_id
+              WHERE wn.created_at >= NOW() - ($1 || ' days')::INTERVAL
+              ORDER BY wn.created_at DESC`, [periodDays, TZ]),
+    db.query(`SELECT wr.id, wr.user_id, u.nombre, wr.tipo, wr.descripcion, wr.is_anonymous,
+                     wr.reviewed, wr.reviewed_at, wr.created_at
+              FROM wellness_reports wr LEFT JOIN users u ON u.id=wr.user_id
+              WHERE wr.created_at >= NOW() - ($1 || ' days')::INTERVAL
+              ORDER BY wr.created_at DESC`, [periodDays]),
+  ]);
+
+  const payload = JSON.stringify({
+    backup_date:  new Date().toISOString(),
+    period_days:  periodDays,
+    entries:      entries.rows,
+    notes:        notes.rows,
+    reports:      reports.rows,
+  });
+
+  const key    = getBackupKey();
+  const iv     = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const enc1   = cipher.update(payload, 'utf8', 'hex');
+  const enc2   = cipher.final('hex');
+  const authTag = cipher.getAuthTag().toString('hex');
+  const encrypted = enc1 + enc2;
+  const checksum  = crypto.createHash('sha256').update(payload).digest('hex');
+
+  const total = entries.rows.length + notes.rows.length + reports.rows.length;
+
+  const { rows } = await db.query(
+    `INSERT INTO wellness_backups
+       (id, period_days, record_count, size_bytes, encrypted_data, iv, auth_tag, checksum)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id, created_at, period_days, record_count, size_bytes`,
+    [uuidv4(), periodDays, total, Buffer.byteLength(encrypted,'hex'),
+     encrypted, iv.toString('hex'), authTag, checksum]
+  );
+  return rows[0];
+}
+
+// ── GET /wellness/admin/backups ───────────────────────────────
+router.get('/admin/backups', auth, roles('admin'), async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT id, created_at, period_days, record_count, size_bytes
+       FROM wellness_backups ORDER BY created_at DESC LIMIT 50`
+    );
+    res.json({ ok: true, data: rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// ── POST /wellness/admin/backups — generar backup manual ──────
+router.post('/admin/backups', auth, roles('admin'), async (req, res) => {
+  try {
+    const days = Math.min(730, Math.max(7, parseInt(req.body?.days) || 730));
+    const backup = await runBackup(days);
+    res.status(201).json({ ok: true, data: backup });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// ── GET /wellness/admin/backups/:id/download ──────────────────
+router.get('/admin/backups/:id/download', auth, roles('admin'), async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT * FROM wellness_backups WHERE id=$1`, [req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND' } });
+
+    const b = rows[0];
+    const key    = getBackupKey();
+    const iv     = Buffer.from(b.iv, 'hex');
+    const authTag = Buffer.from(b.auth_tag, 'hex');
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+    decipher.setAuthTag(authTag);
+    const dec1 = decipher.update(b.encrypted_data, 'hex', 'utf8');
+    const dec2 = decipher.final('utf8');
+    const plaintext = dec1 + dec2;
+
+    const checksum = crypto.createHash('sha256').update(plaintext).digest('hex');
+    if (checksum !== b.checksum) {
+      return res.status(500).json({ ok: false, error: { code: 'CHECKSUM_MISMATCH', message: 'Integridad del backup comprometida' } });
+    }
+
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', `attachment; filename="wellness_backup_${b.created_at.toISOString().slice(0,10)}.json"`);
+    res.send(plaintext);
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// ── DELETE /wellness/admin/backups/:id ────────────────────────
+router.delete('/admin/backups/:id', auth, roles('admin'), async (req, res) => {
+  try {
+    const { rows } = await db.query(`DELETE FROM wellness_backups WHERE id=$1 RETURNING id`, [req.params.id]);
+    if (!rows.length) return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND' } });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// ── Backup automático cada 14 días ────────────────────────────
+(function scheduleBackups() {
+  const INTERVAL_MS = 14 * 24 * 60 * 60 * 1000; // 14 días
+  async function doBackup() {
+    try {
+      const b = await runBackup(730);
+      console.log(`[wellness] Backup automático creado: ${b.id} — ${b.record_count} registros`);
+      // Eliminar backups viejos (conservar últimos 10)
+      await db.query(
+        `DELETE FROM wellness_backups WHERE id NOT IN (
+           SELECT id FROM wellness_backups ORDER BY created_at DESC LIMIT 10
+         )`
+      );
+    } catch(e) {
+      console.warn('[wellness] Backup automático falló:', e.message);
+    }
+  }
+  setTimeout(function tick() {
+    doBackup();
+    setTimeout(tick, INTERVAL_MS);
+  }, INTERVAL_MS);
+})();
 
 module.exports = router;
