@@ -127,8 +127,8 @@ router.post('/checkin', auth, async (req, res) => {
     if (nota) {
       await db.query(
         `INSERT INTO wellness_notes (id, user_id, mood, categories, nota) VALUES ($1, $2, $3, $4, $5)`,
-        [uuidv4(), req.user.id, mood, categories, nota]
-      ).catch(() => {});
+        [uuidv4(), req.user.id, mood, JSON.stringify(categories), nota]
+      ).catch(e => console.warn('[wellness_notes insert]', e.message));
     }
 
     // Alerta: 3+ días consecutivos con mood <= 2
