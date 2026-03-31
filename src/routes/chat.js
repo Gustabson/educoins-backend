@@ -88,9 +88,18 @@ router.get('/global/messages', auth, async (req, res) => {
       SELECT
         m.id, m.texto, m.created_at,
         m.conversation_id,
-        u.id        AS sender_id,
-        u.nombre AS sender_nombre,
-        u.rol       AS sender_rol,
+        u.id AS sender_id,
+        CASE
+          WHEN u.id = $3 OR EXISTS (
+            SELECT 1 FROM friendships f
+            WHERE ((f.requester_id = $3 AND f.addressee_id = u.id)
+                OR (f.addressee_id = $3 AND f.requester_id = u.id))
+              AND f.estado = 'accepted'
+              AND NOT f.removed_by_requester AND NOT f.removed_by_addressee
+          ) THEN COALESCE(u.apodo, u.nombre)
+          ELSE u.nombre
+        END AS sender_nombre,
+        u.rol AS sender_rol,
         u.skin, u.border, u.avatar_bg, u.foto_url
       FROM messages m
       JOIN conversations c ON c.id = m.conversation_id AND c.type = 'global'
@@ -98,7 +107,7 @@ router.get('/global/messages', auth, async (req, res) => {
       WHERE ($1::timestamptz IS NULL OR m.created_at < $1)
       ORDER BY m.created_at DESC
       LIMIT $2
-    `, [before, MSG_LIMIT]);
+    `, [before, MSG_LIMIT, req.user.id]);
 
     // Marcar como leido
     const { rows: conv } = await db.query(
@@ -170,9 +179,18 @@ router.get('/classroom/messages', auth, async (req, res) => {
       SELECT
         m.id, m.texto, m.created_at,
         m.conversation_id,
-        u.id     AS sender_id,
-        u.nombre AS sender_nombre,
-        u.rol    AS sender_rol,
+        u.id AS sender_id,
+        CASE
+          WHEN u.id = $4 OR EXISTS (
+            SELECT 1 FROM friendships f
+            WHERE ((f.requester_id = $4 AND f.addressee_id = u.id)
+                OR (f.addressee_id = $4 AND f.requester_id = u.id))
+              AND f.estado = 'accepted'
+              AND NOT f.removed_by_requester AND NOT f.removed_by_addressee
+          ) THEN COALESCE(u.apodo, u.nombre)
+          ELSE u.nombre
+        END AS sender_nombre,
+        u.rol AS sender_rol,
         u.skin, u.border, u.avatar_bg, u.foto_url
       FROM messages m
       LEFT JOIN users u ON u.id = m.sender_id
@@ -180,7 +198,7 @@ router.get('/classroom/messages', auth, async (req, res) => {
         AND ($2::timestamptz IS NULL OR m.created_at < $2)
       ORDER BY m.created_at DESC
       LIMIT $3
-    `, [convId, before, MSG_LIMIT]);
+    `, [convId, before, MSG_LIMIT, req.user.id]);
 
     // Actualizar last_read
     await db.query(`
@@ -209,8 +227,17 @@ router.get('/personal/:userId/messages', auth, async (req, res) => {
       SELECT
         m.id, m.texto, m.created_at,
         m.conversation_id,
-        u.id     AS sender_id,
-        u.nombre AS sender_nombre,
+        u.id AS sender_id,
+        CASE
+          WHEN u.id = $4 OR EXISTS (
+            SELECT 1 FROM friendships f
+            WHERE ((f.requester_id = $4 AND f.addressee_id = u.id)
+                OR (f.addressee_id = $4 AND f.requester_id = u.id))
+              AND f.estado = 'accepted'
+              AND NOT f.removed_by_requester AND NOT f.removed_by_addressee
+          ) THEN COALESCE(u.apodo, u.nombre)
+          ELSE u.nombre
+        END AS sender_nombre,
         u.skin, u.border, u.avatar_bg, u.foto_url
       FROM messages m
       LEFT JOIN users u ON u.id = m.sender_id
@@ -218,7 +245,7 @@ router.get('/personal/:userId/messages', auth, async (req, res) => {
         AND ($2::timestamptz IS NULL OR m.created_at < $2)
       ORDER BY m.created_at DESC
       LIMIT $3
-    `, [convId, before, MSG_LIMIT]);
+    `, [convId, before, MSG_LIMIT, req.user.id]);
 
     await db.query(`
       INSERT INTO conversation_members (conversation_id, user_id, last_read_at)
@@ -604,7 +631,17 @@ router.get('/groups/:id/messages', auth, async (req, res) => {
       SELECT
         m.id, m.texto, m.created_at, m.conversation_id,
         u.id AS sender_id,
-        u.nombre AS sender_nombre, u.rol AS sender_rol,
+        CASE
+          WHEN u.id = $4 OR EXISTS (
+            SELECT 1 FROM friendships f
+            WHERE ((f.requester_id = $4 AND f.addressee_id = u.id)
+                OR (f.addressee_id = $4 AND f.requester_id = u.id))
+              AND f.estado = 'accepted'
+              AND NOT f.removed_by_requester AND NOT f.removed_by_addressee
+          ) THEN COALESCE(u.apodo, u.nombre)
+          ELSE u.nombre
+        END AS sender_nombre,
+        u.rol AS sender_rol,
         u.skin, u.border, u.avatar_bg, u.foto_url
       FROM messages m
       LEFT JOIN users u ON u.id = m.sender_id
@@ -612,7 +649,7 @@ router.get('/groups/:id/messages', auth, async (req, res) => {
         AND ($2::timestamptz IS NULL OR m.created_at < $2)
       ORDER BY m.created_at DESC
       LIMIT $3
-    `, [convId, before, MSG_LIMIT]);
+    `, [convId, before, MSG_LIMIT, req.user.id]);
 
     await db.query(`
       INSERT INTO conversation_members (conversation_id, user_id, last_read_at)
