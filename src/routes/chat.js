@@ -309,8 +309,9 @@ router.get('/users/search', auth, async (req, res) => {
         f.id     AS friendship_id
       FROM users u
       LEFT JOIN friendships f ON
-        (f.requester_id = $1 AND f.addressee_id = u.id) OR
-        (f.addressee_id = $1 AND f.requester_id = u.id)
+        ((f.requester_id = $1 AND f.addressee_id = u.id) OR
+         (f.addressee_id = $1 AND f.requester_id = u.id))
+        AND NOT (f.removed_by_requester AND f.removed_by_addressee)
       WHERE u.id <> $1
         AND u.activo = TRUE
         AND (u.nombre ILIKE $2 OR u.apodo ILIKE $2)
