@@ -507,6 +507,10 @@ router.patch('/:id/approve', auth, roles('admin'), async (req, res) => {
       return res.status(409).json({ ok: false, error: { code: 'ALREADY_APPROVED' } });
     if (poll[0].activa || !poll[0].fin || new Date(poll[0].fin) > new Date())
       return res.status(400).json({ ok: false, error: { code: 'POLL_NOT_CLOSED', message: 'Solo se pueden aprobar votaciones que ya terminaron' } });
+    const { rows: vc } = await db.query(
+      'SELECT COUNT(*)::int AS total FROM poll_votes WHERE poll_id=$1', [req.params.id]);
+    if (vc[0].total === 0)
+      return res.status(400).json({ ok: false, error: { code: 'NO_VOTES', message: 'No se puede aprobar una votación sin ningún voto registrado' } });
     await db.query(
       `UPDATE polls SET status='approved', approved_at=NOW(), approved_by=$1 WHERE id=$2`,
       [req.user.id, req.params.id]

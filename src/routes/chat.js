@@ -407,14 +407,14 @@ router.post('/friends/:id/accept', auth, async (req, res) => {
 });
 
 // ── DELETE /chat/friends/:id ──────────────────────────────────
-// Eliminación asimétrica: solo marca que YO eliminé, el otro sigue viéndolo
+// Eliminación simétrica: ambos dejan de verse (evita notificaciones huérfanas)
 router.delete('/friends/:id', auth, async (req, res) => {
   try {
     const { rows, rowCount } = await db.query(`
       UPDATE friendships
       SET
-        removed_by_requester = CASE WHEN requester_id = $2 THEN TRUE ELSE removed_by_requester END,
-        removed_by_addressee = CASE WHEN addressee_id = $2 THEN TRUE ELSE removed_by_addressee END,
+        removed_by_requester = TRUE,
+        removed_by_addressee = TRUE,
         updated_at = NOW()
       WHERE id = $1
         AND (requester_id = $2 OR addressee_id = $2)
@@ -428,11 +428,15 @@ router.delete('/friends/:id', auth, async (req, res) => {
       return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND', message: 'Amistad no encontrada' } });
     }
 
-    // Notificar al otro en tiempo real
+    // Notificar a ambos en tiempo real para que recarguen su lista
     const { getIO } = require('../socket');
     const io = getIO();
     if (io) {
       io.to(`user:${rows[0].other_id}`).emit('friend_removed', {
+        friendship_id: req.params.id,
+        by_user_id: req.user.id,
+      });
+      io.to(`user:${req.user.id}`).emit('friend_removed', {
         friendship_id: req.params.id,
         by_user_id: req.user.id,
       });
