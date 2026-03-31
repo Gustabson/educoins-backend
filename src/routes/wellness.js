@@ -484,7 +484,7 @@ router.get('/admin/students', auth, roles('admin', 'teacher'), async (req, res) 
     const today  = todayAR();
 
     const [stRes, entRes, repRes] = await Promise.all([
-      db.query(`SELECT id, nombre, curso, avatar_bg FROM users WHERE rol='student' AND activo=TRUE ORDER BY nombre`),
+      db.query(`SELECT id, nombre, avatar_bg FROM users WHERE rol='student' AND activo=TRUE ORDER BY nombre`),
       db.query(
         `SELECT user_id, mood, categories,
                 (nota IS NOT NULL AND nota <> '') AS has_nota,
@@ -528,7 +528,7 @@ router.get('/admin/student/:userId', auth, roles('admin', 'teacher'), async (req
     const days = Math.min(730, Math.max(7, parseInt(req.query.days) || 30));
 
     const [stRes, entRes, notesRes, repRes, unreadRes] = await Promise.all([
-      db.query(`SELECT id, nombre, curso, avatar_bg FROM users WHERE id = $1`, [uid]),
+      db.query(`SELECT id, nombre, avatar_bg FROM users WHERE id = $1`, [uid]),
       db.query(
         `SELECT mood, categories,
                 (nota IS NOT NULL AND nota <> '') AS has_nota,
@@ -586,7 +586,7 @@ router.get('/admin/explore', auth, roles('admin', 'teacher'), async (req, res) =
 
     const [stRes, entRes, notesRes] = await Promise.all([
       db.query(
-        `SELECT id, nombre, curso, avatar_bg FROM users WHERE rol='student' AND activo=TRUE ORDER BY nombre`
+        `SELECT id, nombre, avatar_bg FROM users WHERE rol='student' AND activo=TRUE ORDER BY nombre`
       ),
       db.query(
         `SELECT DISTINCT ON (user_id)
