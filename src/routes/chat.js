@@ -343,40 +343,78 @@ router.post('/friends/request', auth, async (req, res) => {
       return res.status(400).json({ ok: false, error: { code: 'SELF_FRIEND', message: 'No podes agregarte a vos mismo' } });
     }
 
-    // Verificar que el usuario destino existe
     const { rows: target } = await db.query(
-      'SELECT id, nombre FROM users WHERE id = $1 AND activo = TRUE',
-      [addressee_id]
+      'SELECT id, nombre FROM users WHERE id = $1 AND activo = TRUE', [addressee_id]
     );
     if (target.length === 0) {
       return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND', message: 'Usuario no encontrado' } });
     }
 
-    try {
-      const { rows } = await db.query(`
-        INSERT INTO friendships (requester_id, addressee_id, estado)
-        VALUES ($1, $2, 'pending')
-        RETURNING id, estado, created_at
-      `, [req.user.id, addressee_id]);
+    // Verificar si ya existe relación en CUALQUIER dirección
+    const { rows: existing } = await db.query(`
+      SELECT id, requester_id, addressee_id, estado, removed_by_requester, removed_by_addressee
+      FROM friendships
+      WHERE (requester_id = $1 AND addressee_id = $2)
+         OR (requester_id = $2 AND addressee_id = $1)
+    `, [req.user.id, addressee_id]);
 
-      // Notificar al destinatario en tiempo real
-      const { getIO } = require('../socket');
-      const io = getIO();
-      if (io) {
-        io.to(`user:${addressee_id}`).emit('friend_request', {
-          friendship_id: rows[0].id,
-          from_user_id:  req.user.id,
-          from_nombre:   req.user.nombre,
-        });
+    if (existing.length > 0) {
+      const f = existing[0];
+      const isReverse   = f.requester_id === addressee_id;
+      const bothRemoved = f.removed_by_requester && f.removed_by_addressee;
+
+      // Ya son amigos activos
+      if (f.estado === 'accepted' && !bothRemoved) {
+        return res.status(409).json({ ok: false, error: { code: 'ALREADY_FRIENDS', message: 'Ya son amigos' } });
       }
 
-      res.status(201).json({ ok: true, data: { ...rows[0], nombre: target[0].nombre } });
-    } catch (e) {
-      if (e.code === '23505') {
-        return res.status(409).json({ ok: false, error: { code: 'ALREADY_REQUESTED', message: 'Ya existe una solicitud con este usuario' } });
+      // Hay una solicitud pendiente en la dirección inversa → auto-aceptar
+      if (f.estado === 'pending' && isReverse) {
+        const { rows: accepted } = await db.query(`
+          UPDATE friendships SET estado = 'accepted', updated_at = NOW()
+          WHERE id = $1 RETURNING id, requester_id, addressee_id, estado
+        `, [f.id]);
+        await getOrCreatePersonalConv(req.user.id, addressee_id);
+        const { getIO } = require('../socket');
+        const io = getIO();
+        if (io) {
+          io.to(`user:${addressee_id}`).emit('friend_accepted', {
+            friendship_id: f.id,
+            by_user_id:    req.user.id,
+            by_nombre:     req.user.nombre,
+          });
+        }
+        return res.json({ ok: true, data: { ...accepted[0], nombre: target[0].nombre } });
       }
-      throw e;
+
+      // Solicitud pendiente ya enviada por mí
+      if (f.estado === 'pending' && !isReverse) {
+        return res.status(409).json({ ok: false, error: { code: 'ALREADY_REQUESTED', message: 'Ya enviaste una solicitud' } });
+      }
+
+      // Ambos se eliminaron → borrar registro y permitir re-solicitar
+      if (bothRemoved) {
+        await db.query('DELETE FROM friendships WHERE id = $1', [f.id]);
+      }
     }
+
+    const { rows } = await db.query(`
+      INSERT INTO friendships (requester_id, addressee_id, estado)
+      VALUES ($1, $2, 'pending')
+      RETURNING id, estado, created_at
+    `, [req.user.id, addressee_id]);
+
+    const { getIO } = require('../socket');
+    const io = getIO();
+    if (io) {
+      io.to(`user:${addressee_id}`).emit('friend_request', {
+        friendship_id: rows[0].id,
+        from_user_id:  req.user.id,
+        from_nombre:   req.user.nombre,
+      });
+    }
+
+    res.status(201).json({ ok: true, data: { ...rows[0], nombre: target[0].nombre } });
   } catch (err) {
     console.error('POST /chat/friends/request error:', err);
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: 'Error al enviar solicitud' } });
