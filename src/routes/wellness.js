@@ -238,4 +238,299 @@ router.patch('/reports/:id', auth, roles('admin', 'teacher'), async (req, res) =
   }
 });
 
+// ══════════════════════════════════════════════════════════════
+// PSICOLOGÍA — Config + Algoritmo de Riesgo + Endpoints Admin
+// ══════════════════════════════════════════════════════════════
+
+const DEFAULT_CFG = {
+  low_mood_threshold: 2,
+  weights: {
+    low_avg_7d:      20,
+    consecutive_low: 10,
+    consecutive_cap: 50,
+    unread_report:   30,
+    high_risk_cat:    5,
+    sudden_drop:     15,
+    no_data:          8,
+  },
+  high_risk_categories: ['miedo', 'soledad', 'presion'],
+  risk_levels: { attention: 15, priority: 35, urgent: 60 },
+  show_notas: true,
+};
+
+// Crear tabla si no existe
+db.query(`
+  CREATE TABLE IF NOT EXISTS wellness_config (
+    id         SERIAL PRIMARY KEY,
+    config     JSONB NOT NULL DEFAULT '{}',
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )
+`).then(async () => {
+  const { rows } = await db.query('SELECT id FROM wellness_config LIMIT 1');
+  if (!rows.length)
+    await db.query('INSERT INTO wellness_config (config) VALUES ($1)', [JSON.stringify(DEFAULT_CFG)]);
+}).catch(e => console.warn('[wellness_config]', e.message));
+
+async function getWellnessCfg() {
+  try {
+    const { rows } = await db.query('SELECT config FROM wellness_config LIMIT 1');
+    if (!rows.length) return DEFAULT_CFG;
+    const c = rows[0].config;
+    return {
+      ...DEFAULT_CFG, ...c,
+      weights:      { ...DEFAULT_CFG.weights,      ...(c.weights      || {}) },
+      risk_levels:  { ...DEFAULT_CFG.risk_levels,  ...(c.risk_levels  || {}) },
+    };
+  } catch { return DEFAULT_CFG; }
+}
+
+function daysAgoAR(n) {
+  const d = new Date();
+  d.setDate(d.getDate() - n);
+  return d.toLocaleString('sv-SE', { timeZone: TZ }).slice(0, 10);
+}
+
+function computeRisk(student, entries, unreadReports, cfg) {
+  const w   = cfg.weights;
+  const thr = cfg.low_mood_threshold ?? 2;
+
+  // Una entrada por día (la más reciente), ordenadas desc
+  const byDate = new Map();
+  entries.forEach(e => {
+    const d = String(e.date).slice(0, 10);
+    if (!byDate.has(d)) byDate.set(d, parseInt(e.mood));
+  });
+  const daily = [...byDate.entries()].sort((a, b) => b[0].localeCompare(a[0]));
+
+  const d7  = daysAgoAR(7);
+  const d14 = daysAgoAR(14);
+
+  const recent7  = entries.filter(e => String(e.date).slice(0, 10) >= d7);
+  const prev7    = entries.filter(e => { const d = String(e.date).slice(0, 10); return d >= d14 && d < d7; });
+
+  const avg7d    = recent7.length ? recent7.reduce((s, e) => s + parseInt(e.mood), 0) / recent7.length    : null;
+  const avgPrev7 = prev7.length   ? prev7.reduce((s,   e) => s + parseInt(e.mood), 0) / prev7.length      : null;
+
+  // Días consecutivos bajos desde el más reciente
+  let consecutive = 0;
+  for (const [, mood] of daily) { if (mood <= thr) consecutive++; else break; }
+
+  const lastDate  = daily[0]?.[0] ?? null;
+  const lastMood  = daily[0]?.[1] ?? null;
+  const today     = todayAR();
+  const daysSince = lastDate ? Math.floor((new Date(today) - new Date(lastDate)) / 86400000) : null;
+
+  // Frecuencia de categorías (últimos 7 días)
+  const catCnt = {};
+  recent7.forEach(e => {
+    const cats = Array.isArray(e.categories) ? e.categories : [];
+    cats.forEach(c => { catCnt[c] = (catCnt[c] || 0) + 1; });
+  });
+  const hrCats    = (cfg.high_risk_categories || ['miedo','soledad','presion']).filter(c => catCnt[c]);
+  const suddenDrop = lastMood !== null && avgPrev7 !== null && (avgPrev7 - lastMood) >= 2;
+
+  // Puntuación
+  const br = {};
+  br.low_avg      = (avg7d !== null && avg7d <= thr + 0.5)
+    ? Math.min(w.low_avg_7d, Math.round((thr + 1 - avg7d) * w.low_avg_7d)) : 0;
+  br.consecutive  = Math.min(w.consecutive_cap, consecutive * w.consecutive_low);
+  br.reports      = unreadReports * w.unread_report;
+  br.high_risk    = hrCats.length * w.high_risk_cat;
+  br.sudden_drop  = suddenDrop ? w.sudden_drop : 0;
+  br.no_data      = (daysSince === null || daysSince >= 7) ? w.no_data : 0;
+  const score     = Object.values(br).reduce((s, v) => s + v, 0);
+
+  const lvl = cfg.risk_levels;
+  const risk_level = score >= (lvl.urgent    ?? 60) ? 'urgent'
+    :                score >= (lvl.priority  ?? 35) ? 'priority'
+    :                score >= (lvl.attention ?? 15) ? 'attention'
+    :                'normal';
+
+  // Tendencia: promedio de los últimos 3 días vs los 3 anteriores
+  let trend = 'stable';
+  if (daily.length >= 4) {
+    const r3 = daily.slice(0, 3).reduce((s, [, m]) => s + m, 0) / 3;
+    const p  = daily.slice(3, 6);
+    if (p.length) {
+      const o3 = p.reduce((s, [, m]) => s + m, 0) / p.length;
+      if (r3 - o3 >  0.5) trend = 'improving';
+      if (o3 - r3 >  0.5) trend = 'declining';
+    }
+  }
+
+  return {
+    ...student,
+    risk_score:      Math.round(score),
+    risk_level,
+    avg_7d:          avg7d !== null ? Math.round(avg7d * 10) / 10 : null,
+    consecutive_low: consecutive,
+    last_mood:       lastMood,
+    last_entry_date: lastDate,
+    days_since_entry:daysSince,
+    unread_reports:  unreadReports,
+    top_cats:        Object.entries(catCnt).sort((a, b) => b[1] - a[1]).slice(0, 4).map(([id, cnt]) => ({ id, cnt })),
+    high_risk_cats:  hrCats,
+    trend,
+    has_nota:        entries.some(e => e.has_nota),
+    total_entries:   daily.length,
+    score_breakdown: br,
+  };
+}
+
+// ── GET /wellness/admin/dashboard ────────────────────────────
+router.get('/admin/dashboard', auth, roles('admin', 'teacher'), async (req, res) => {
+  try {
+    const today = todayAR();
+    const [todayStats, moodDist, catStats, alertRows, unreadCnt, totalSt] = await Promise.all([
+      db.query(
+        `SELECT COUNT(DISTINCT user_id) AS checked_today,
+                ROUND(AVG(mood)::numeric, 1) AS avg_mood
+         FROM mood_entries WHERE DATE(created_at AT TIME ZONE $1) = $2`,
+        [TZ, today]
+      ),
+      db.query(
+        `SELECT mood, COUNT(*) AS cnt FROM mood_entries
+         WHERE DATE(created_at AT TIME ZONE $1) = $2 GROUP BY mood ORDER BY mood`,
+        [TZ, today]
+      ),
+      db.query(
+        `SELECT cat, COUNT(*) AS cnt
+         FROM mood_entries, UNNEST(categories) AS cat
+         WHERE DATE(created_at AT TIME ZONE $1) >= $2::date - 7
+         GROUP BY cat ORDER BY cnt DESC LIMIT 8`,
+        [TZ, today]
+      ),
+      db.query(
+        `SELECT u.id, u.nombre,
+                COUNT(*) FILTER (WHERE me.mood <= 2) AS low_days
+         FROM mood_entries me
+         JOIN users u ON u.id = me.user_id
+         WHERE DATE(me.created_at AT TIME ZONE $1) >= $2::date - 7
+         GROUP BY u.id, u.nombre
+         HAVING COUNT(*) FILTER (WHERE me.mood <= 2) >= 3
+         ORDER BY low_days DESC LIMIT 5`,
+        [TZ, today]
+      ),
+      db.query(`SELECT COUNT(*) AS cnt FROM wellness_reports WHERE NOT reviewed`),
+      db.query(`SELECT COUNT(*) AS cnt FROM users WHERE rol='student' AND activo=TRUE`),
+    ]);
+
+    res.json({ ok: true, data: {
+      total_students:  parseInt(totalSt.rows[0].cnt),
+      checked_today:   parseInt(todayStats.rows[0].checked_today),
+      avg_mood_today:  todayStats.rows[0].avg_mood ? parseFloat(todayStats.rows[0].avg_mood) : null,
+      unread_reports:  parseInt(unreadCnt.rows[0].cnt),
+      mood_dist:       moodDist.rows.map(r => ({ mood: parseInt(r.mood), cnt: parseInt(r.cnt) })),
+      top_categories:  catStats.rows.map(r => ({ cat: r.cat, cnt: parseInt(r.cnt) })),
+      recent_alerts:   alertRows.rows.map(r => ({ ...r, low_days: parseInt(r.low_days) })),
+    }});
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// ── GET /wellness/admin/students ─────────────────────────────
+router.get('/admin/students', auth, roles('admin', 'teacher'), async (req, res) => {
+  try {
+    const cfg    = await getWellnessCfg();
+    const filter = req.query.filter || 'all';
+    const today  = todayAR();
+
+    const [stRes, entRes, repRes] = await Promise.all([
+      db.query(`SELECT id, nombre, curso, avatar_bg FROM users WHERE rol='student' AND activo=TRUE ORDER BY nombre`),
+      db.query(
+        `SELECT user_id, mood, categories,
+                (nota IS NOT NULL AND nota <> '') AS has_nota,
+                DATE(created_at AT TIME ZONE $1)::text AS date
+         FROM mood_entries
+         WHERE DATE(created_at AT TIME ZONE $1) >= $2::date - 30
+         ORDER BY created_at DESC`,
+        [TZ, today]
+      ),
+      db.query(
+        `SELECT user_id, COUNT(*) AS unread
+         FROM wellness_reports WHERE user_id IS NOT NULL AND NOT reviewed
+         GROUP BY user_id`
+      ),
+    ]);
+
+    const byUser  = new Map();
+    entRes.rows.forEach(e => {
+      if (!byUser.has(e.user_id)) byUser.set(e.user_id, []);
+      byUser.get(e.user_id).push(e);
+    });
+    const repMap = new Map(repRes.rows.map(r => [r.user_id, parseInt(r.unread)]));
+
+    let result = stRes.rows.map(s =>
+      computeRisk(s, byUser.get(s.id) || [], repMap.get(s.id) || 0, cfg)
+    );
+    if (filter !== 'all') result = result.filter(s => s.risk_level === filter);
+    result.sort((a, b) => b.risk_score - a.risk_score);
+
+    res.json({ ok: true, data: result });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// ── GET /wellness/admin/student/:userId ──────────────────────
+router.get('/admin/student/:userId', auth, roles('admin', 'teacher'), async (req, res) => {
+  try {
+    const cfg = await getWellnessCfg();
+    const uid = req.params.userId;
+
+    const [stRes, entRes, repRes, unreadRes] = await Promise.all([
+      db.query(`SELECT id, nombre, curso, avatar_bg FROM users WHERE id = $1`, [uid]),
+      db.query(
+        `SELECT mood, categories,
+                CASE WHEN $2 THEN nota ELSE NULL END AS nota,
+                (nota IS NOT NULL AND nota <> '')    AS has_nota,
+                DATE(created_at AT TIME ZONE $3)::text AS date
+         FROM mood_entries WHERE user_id = $1
+         ORDER BY created_at DESC LIMIT 60`,
+        [uid, !!cfg.show_notas, TZ]
+      ),
+      db.query(
+        `SELECT id, tipo, descripcion, is_anonymous, reviewed, reviewed_at, created_at
+         FROM wellness_reports WHERE user_id = $1 ORDER BY created_at DESC`,
+        [uid]
+      ),
+      db.query(`SELECT COUNT(*) AS unread FROM wellness_reports WHERE user_id=$1 AND NOT reviewed`, [uid]),
+    ]);
+
+    if (!stRes.rows.length)
+      return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND' } });
+
+    const student = stRes.rows[0];
+    const risk    = computeRisk(student, entRes.rows, parseInt(unreadRes.rows[0].unread), cfg);
+
+    res.json({ ok: true, data: { student, risk, entries: entRes.rows, reports: repRes.rows } });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// ── GET /wellness/admin/config ───────────────────────────────
+router.get('/admin/config', auth, roles('admin', 'teacher'), async (req, res) => {
+  try {
+    res.json({ ok: true, data: await getWellnessCfg() });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// ── PUT /wellness/admin/config ───────────────────────────────
+router.put('/admin/config', auth, roles('admin'), async (req, res) => {
+  try {
+    const { rows } = await db.query('SELECT id FROM wellness_config LIMIT 1');
+    if (rows.length)
+      await db.query('UPDATE wellness_config SET config=$1, updated_at=NOW() WHERE id=$2', [JSON.stringify(req.body), rows[0].id]);
+    else
+      await db.query('INSERT INTO wellness_config (config) VALUES ($1)', [JSON.stringify(req.body)]);
+    res.json({ ok: true, data: await getWellnessCfg() });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 module.exports = router;
