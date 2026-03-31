@@ -527,7 +527,7 @@ router.get('/admin/student/:userId', auth, roles('admin', 'teacher'), async (req
     const uid  = req.params.userId;
     const days = Math.min(730, Math.max(7, parseInt(req.query.days) || 30));
 
-    const [stRes, entRes, notesRes, repRes, unreadRes] = await Promise.all([
+    const [stRes, entRes, repRes, unreadRes] = await Promise.all([
       db.query(`SELECT id, nombre, avatar_bg FROM users WHERE id = $1`, [uid]),
       db.query(
         `SELECT mood, categories,
@@ -538,6 +538,17 @@ router.get('/admin/student/:userId', auth, roles('admin', 'teacher'), async (req
         [uid, TZ]
       ),
       db.query(
+        `SELECT id, tipo, descripcion, is_anonymous, reviewed, reviewed_at, created_at
+         FROM wellness_reports WHERE user_id = $1 ORDER BY created_at DESC`,
+        [uid]
+      ),
+      db.query(`SELECT COUNT(*) AS unread FROM wellness_reports WHERE user_id=$1 AND NOT reviewed`, [uid]),
+    ]);
+
+    // wellness_notes separado: si la tabla no existe aún, devuelve [] sin romper el endpoint
+    let notesRows = [];
+    try {
+      const notesRes = await db.query(
         `SELECT id,
                 CASE WHEN $2 THEN nota ELSE NULL END AS nota,
                 mood, categories,
@@ -546,17 +557,12 @@ router.get('/admin/student/:userId', auth, roles('admin', 'teacher'), async (req
                 created_at
          FROM wellness_notes
          WHERE user_id = $1
-           AND created_at >= NOW() - ($4 || ' days')::INTERVAL
+           AND created_at >= NOW() - ($4::text || ' days')::INTERVAL
          ORDER BY created_at DESC`,
         [uid, !!cfg.show_notas, TZ, days]
-      ),
-      db.query(
-        `SELECT id, tipo, descripcion, is_anonymous, reviewed, reviewed_at, created_at
-         FROM wellness_reports WHERE user_id = $1 ORDER BY created_at DESC`,
-        [uid]
-      ),
-      db.query(`SELECT COUNT(*) AS unread FROM wellness_reports WHERE user_id=$1 AND NOT reviewed`, [uid]),
-    ]);
+      );
+      notesRows = notesRes.rows;
+    } catch(e) { console.warn('[student notes]', e.message); }
 
     if (!stRes.rows.length)
       return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND' } });
@@ -567,7 +573,7 @@ router.get('/admin/student/:userId', auth, roles('admin', 'teacher'), async (req
     res.json({ ok: true, data: {
       student, risk,
       entries: entRes.rows,
-      notes:   notesRes.rows,
+      notes:   notesRows,
       reports: repRes.rows,
     } });
   } catch (err) {
@@ -584,7 +590,7 @@ router.get('/admin/explore', auth, roles('admin', 'teacher'), async (req, res) =
     const today  = todayAR();
     const since  = daysAgoAR(days - 1);
 
-    const [stRes, entRes, notesRes] = await Promise.all([
+    const [stRes, entRes] = await Promise.all([
       db.query(
         `SELECT id, nombre, avatar_bg FROM users WHERE rol='student' AND activo=TRUE ORDER BY nombre`
       ),
@@ -598,22 +604,28 @@ router.get('/admin/explore', auth, roles('admin', 'teacher'), async (req, res) =
          ORDER BY user_id, created_at DESC`,
         [since, TZ]
       ),
-      db.query(
-        `SELECT user_id,
-                CASE WHEN $2 THEN nota ELSE NULL END AS nota,
-                mood, categories,
-                DATE(created_at AT TIME ZONE $3)::text        AS date,
-                TO_CHAR(created_at AT TIME ZONE $3, 'HH24:MI') AS time
-         FROM wellness_notes
-         WHERE created_at >= NOW() - ($4 || ' days')::INTERVAL
-         ORDER BY created_at DESC`,
-        [since, !!cfg.show_notas, TZ, days]
-      ),
     ]);
+
+    // wellness_notes separado: si la tabla no existe aún, devuelve [] sin romper el endpoint
+    let notesAllRows = [];
+    try {
+      const notesRes = await db.query(
+        `SELECT user_id,
+                CASE WHEN $1 THEN nota ELSE NULL END AS nota,
+                mood, categories,
+                DATE(created_at AT TIME ZONE $2)::text        AS date,
+                TO_CHAR(created_at AT TIME ZONE $2, 'HH24:MI') AS time
+         FROM wellness_notes
+         WHERE created_at >= NOW() - ($3::text || ' days')::INTERVAL
+         ORDER BY created_at DESC`,
+        [!!cfg.show_notas, TZ, days]
+      );
+      notesAllRows = notesRes.rows;
+    } catch(e) { console.warn('[explore notes]', e.message); }
 
     const entMap   = new Map(entRes.rows.map(e => [e.user_id, e]));
     const notesMap = new Map();
-    notesRes.rows.forEach(n => {
+    notesAllRows.forEach(n => {
       if (!notesMap.has(n.user_id)) notesMap.set(n.user_id, []);
       notesMap.get(n.user_id).push({ ...n, mood: n.mood ? parseInt(n.mood) : null });
     });
