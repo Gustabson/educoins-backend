@@ -152,6 +152,19 @@ router.post('/checkin', auth, async (req, res) => {
       });
     }
 
+    // Notificar al dashboard admin en tiempo real
+    {
+      const io = getIO();
+      if (io) {
+        const { rows: staffWU } = await db.query(
+          "SELECT id FROM users WHERE rol IN ('admin','teacher') AND activo=TRUE"
+        );
+        staffWU.forEach(s =>
+          io.to(`user:${s.id}`).emit('wellness_update', { mood, date: hoy })
+        );
+      }
+    }
+
     res.status(existing.length > 0 ? 200 : 201).json({
       ok: true,
       data: { ...entry, coins_awarded: coinsAwarded, updated: existing.length > 0 },
@@ -505,6 +518,54 @@ router.get('/admin/student/:userId', auth, roles('admin', 'teacher'), async (req
     const risk    = computeRisk(student, entRes.rows, parseInt(unreadRes.rows[0].unread), cfg);
 
     res.json({ ok: true, data: { student, risk, entries: entRes.rows, reports: repRes.rows } });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// ── GET /wellness/admin/explore ──────────────────────────────
+// Vista manual: todos los alumnos con su entrada más reciente del período, con nota
+router.get('/admin/explore', auth, roles('admin', 'teacher'), async (req, res) => {
+  try {
+    const cfg    = await getWellnessCfg();
+    const period = req.query.period || 'today';
+    const today  = todayAR();
+    const since  = period === 'week' ? daysAgoAR(7) : today;
+
+    const [stRes, entRes] = await Promise.all([
+      db.query(
+        `SELECT id, nombre, curso, avatar_bg FROM users WHERE rol='student' AND activo=TRUE ORDER BY nombre`
+      ),
+      db.query(
+        `SELECT DISTINCT ON (user_id)
+                user_id, mood, categories,
+                CASE WHEN $2 THEN nota ELSE NULL END AS nota,
+                (nota IS NOT NULL AND nota <> '') AS has_nota,
+                DATE(created_at AT TIME ZONE $3)::text AS date
+         FROM mood_entries
+         WHERE DATE(created_at AT TIME ZONE $3) >= $1::date
+         ORDER BY user_id, created_at DESC`,
+        [since, !!cfg.show_notas, TZ]
+      ),
+    ]);
+
+    const entMap = new Map(entRes.rows.map(e => [e.user_id, e]));
+    const result = stRes.rows.map(s => ({
+      ...s,
+      entry: entMap.get(s.id)
+        ? { ...entMap.get(s.id), mood: parseInt(entMap.get(s.id).mood) }
+        : null,
+    }));
+
+    // Orden: sin entrada al fondo, con entrada ordenado por mood asc (más bajo primero)
+    result.sort((a, b) => {
+      if (!a.entry && !b.entry) return 0;
+      if (!a.entry) return 1;
+      if (!b.entry) return -1;
+      return a.entry.mood - b.entry.mood;
+    });
+
+    res.json({ ok: true, data: result });
   } catch (err) {
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }
