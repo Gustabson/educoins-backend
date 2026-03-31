@@ -122,6 +122,14 @@ router.post('/checkin', auth, async (req, res) => {
 
     await client.query('COMMIT');
 
+    // Guardar nota en historial independiente (siempre que no esté vacía)
+    if (nota) {
+      await db.query(
+        `INSERT INTO wellness_notes (user_id, mood, categories, nota) VALUES ($1, $2, $3, $4)`,
+        [req.user.id, mood, categories, nota]
+      ).catch(() => {});
+    }
+
     // Alerta: 3+ días consecutivos con mood <= 2
     if (mood <= 2) {
       const { rows: recent } = await db.query(
@@ -271,7 +279,18 @@ const DEFAULT_CFG = {
   show_notas: true,
 };
 
-// Crear tabla si no existe
+// ── Crear tablas si no existen ───────────────────────────────
+db.query(`
+  CREATE TABLE IF NOT EXISTS wellness_notes (
+    id         UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    mood       INT,
+    categories JSONB DEFAULT '[]',
+    nota       TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )
+`).catch(e => console.warn('[wellness_notes]', e.message));
+
 db.query(`
   CREATE TABLE IF NOT EXISTS wellness_config (
     id         SERIAL PRIMARY KEY,
@@ -492,15 +511,27 @@ router.get('/admin/student/:userId', auth, roles('admin', 'teacher'), async (req
     const cfg = await getWellnessCfg();
     const uid = req.params.userId;
 
-    const [stRes, entRes, repRes, unreadRes] = await Promise.all([
+    const [stRes, entRes, notesRes, repRes, unreadRes] = await Promise.all([
       db.query(`SELECT id, nombre, curso, avatar_bg FROM users WHERE id = $1`, [uid]),
       db.query(
         `SELECT mood, categories,
-                CASE WHEN $2 THEN nota ELSE NULL END AS nota,
-                (nota IS NOT NULL AND nota <> '')    AS has_nota,
-                DATE(created_at AT TIME ZONE $3)::text AS date
+                (nota IS NOT NULL AND nota <> '') AS has_nota,
+                DATE(created_at AT TIME ZONE $2)::text AS date
          FROM mood_entries WHERE user_id = $1
          ORDER BY created_at DESC LIMIT 60`,
+        [uid, TZ]
+      ),
+      db.query(
+        `SELECT id,
+                CASE WHEN $2 THEN nota ELSE NULL END AS nota,
+                mood, categories,
+                DATE(created_at AT TIME ZONE $3)::text    AS date,
+                TO_CHAR(created_at AT TIME ZONE $3, 'HH24:MI') AS time,
+                created_at
+         FROM wellness_notes
+         WHERE user_id = $1
+           AND created_at >= NOW() - INTERVAL '20 days'
+         ORDER BY created_at DESC`,
         [uid, !!cfg.show_notas, TZ]
       ),
       db.query(
@@ -517,7 +548,12 @@ router.get('/admin/student/:userId', auth, roles('admin', 'teacher'), async (req
     const student = stRes.rows[0];
     const risk    = computeRisk(student, entRes.rows, parseInt(unreadRes.rows[0].unread), cfg);
 
-    res.json({ ok: true, data: { student, risk, entries: entRes.rows, reports: repRes.rows } });
+    res.json({ ok: true, data: {
+      student, risk,
+      entries: entRes.rows,
+      notes:   notesRes.rows,
+      reports: repRes.rows,
+    } });
   } catch (err) {
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }
@@ -532,29 +568,46 @@ router.get('/admin/explore', auth, roles('admin', 'teacher'), async (req, res) =
     const today  = todayAR();
     const since  = period === 'week' ? daysAgoAR(7) : today;
 
-    const [stRes, entRes] = await Promise.all([
+    const [stRes, entRes, notesRes] = await Promise.all([
       db.query(
         `SELECT id, nombre, curso, avatar_bg FROM users WHERE rol='student' AND activo=TRUE ORDER BY nombre`
       ),
       db.query(
         `SELECT DISTINCT ON (user_id)
                 user_id, mood, categories,
-                CASE WHEN $2 THEN nota ELSE NULL END AS nota,
                 (nota IS NOT NULL AND nota <> '') AS has_nota,
-                DATE(created_at AT TIME ZONE $3)::text AS date
+                DATE(created_at AT TIME ZONE $2)::text AS date
          FROM mood_entries
-         WHERE DATE(created_at AT TIME ZONE $3) >= $1::date
+         WHERE DATE(created_at AT TIME ZONE $2) >= $1::date
          ORDER BY user_id, created_at DESC`,
+        [since, TZ]
+      ),
+      db.query(
+        `SELECT user_id,
+                CASE WHEN $2 THEN nota ELSE NULL END AS nota,
+                mood, categories,
+                DATE(created_at AT TIME ZONE $3)::text    AS date,
+                TO_CHAR(created_at AT TIME ZONE $3, 'HH24:MI') AS time
+         FROM wellness_notes
+         WHERE DATE(created_at AT TIME ZONE $3) >= $1::date
+         ORDER BY created_at DESC`,
         [since, !!cfg.show_notas, TZ]
       ),
     ]);
 
-    const entMap = new Map(entRes.rows.map(e => [e.user_id, e]));
+    const entMap   = new Map(entRes.rows.map(e => [e.user_id, e]));
+    const notesMap = new Map();
+    notesRes.rows.forEach(n => {
+      if (!notesMap.has(n.user_id)) notesMap.set(n.user_id, []);
+      notesMap.get(n.user_id).push({ ...n, mood: n.mood ? parseInt(n.mood) : null });
+    });
+
     const result = stRes.rows.map(s => ({
       ...s,
       entry: entMap.get(s.id)
         ? { ...entMap.get(s.id), mood: parseInt(entMap.get(s.id).mood) }
         : null,
+      notes: notesMap.get(s.id) || [],
     }));
 
     // Orden: sin entrada al fondo, con entrada ordenado por mood asc (más bajo primero)
