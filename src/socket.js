@@ -115,20 +115,16 @@ function initSocket(io) {
           VALUES ($1, $2, $3) RETURNING id, conversation_id, texto, created_at
         `, [conversation_id, user.id, textoClean]);
 
-        // Obtener apodo y name_color del sender
-        let senderApodo = null;
+        // Obtener name_color del sender (nombre real siempre, sin apodo en mensajes)
         let senderNameColor = null;
         try {
           const { rows: senderExtra } = await db.query(`
-            SELECT u.apodo,
-              sc.config AS name_color_config
-            FROM users u
-            LEFT JOIN user_custom_active uca ON uca.user_id = u.id
+            SELECT sc.config AS name_color_config
+            FROM user_custom_active uca
             LEFT JOIN shop_items_custom sc ON sc.id = uca.name_color_id
-            WHERE u.id = $1
+            WHERE uca.user_id = $1
           `, [user.id]);
           if (senderExtra.length) {
-            senderApodo = senderExtra[0].apodo;
             senderNameColor = senderExtra[0].name_color_config;
           }
         } catch(e) {}
@@ -136,7 +132,7 @@ function initSocket(io) {
         const message = {
           ...rows[0],
           sender_id:          user.id,
-          sender_nombre:      senderApodo || user.nombre,
+          sender_nombre:      user.nombre,
           sender_rol:         user.rol,
           skin:               user.skin,
           border:             user.border,

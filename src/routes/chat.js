@@ -89,8 +89,7 @@ router.get('/global/messages', auth, async (req, res) => {
         m.id, m.texto, m.created_at,
         m.conversation_id,
         u.id        AS sender_id,
-        COALESCE(u.apodo, u.nombre) AS sender_nombre,
-        u.apodo AS sender_apodo,
+        u.nombre AS sender_nombre,
         u.rol       AS sender_rol,
         u.skin, u.border, u.avatar_bg, u.foto_url
       FROM messages m
@@ -172,8 +171,7 @@ router.get('/classroom/messages', auth, async (req, res) => {
         m.id, m.texto, m.created_at,
         m.conversation_id,
         u.id     AS sender_id,
-        COALESCE(u.apodo, u.nombre) AS sender_nombre,
-        u.apodo AS sender_apodo,
+        u.nombre AS sender_nombre,
         u.rol    AS sender_rol,
         u.skin, u.border, u.avatar_bg, u.foto_url
       FROM messages m
@@ -203,19 +201,7 @@ router.get('/personal/:userId/messages', auth, async (req, res) => {
   try {
     const otherId = req.params.userId;
 
-    // Verificar que existe una conversacion personal entre ambos (independiente de si siguen siendo amigos)
-    const { rows: convCheck } = await db.query(`
-      SELECT c.id FROM conversations c
-      JOIN conversation_members m1 ON m1.conversation_id = c.id AND m1.user_id = $1
-      JOIN conversation_members m2 ON m2.conversation_id = c.id AND m2.user_id = $2
-      WHERE c.type = 'personal'
-      LIMIT 1
-    `, [req.user.id, otherId]);
-
-    if (convCheck.length === 0) {
-      return res.status(403).json({ ok: false, error: { code: 'NO_CONVERSATION', message: 'No hay conversacion con este usuario' } });
-    }
-
+    // Crear conversación si no existe — mensajear no requiere amistad
     const convId = await getOrCreatePersonalConv(req.user.id, otherId);
     const before = req.query.before || null;
 
@@ -224,8 +210,7 @@ router.get('/personal/:userId/messages', auth, async (req, res) => {
         m.id, m.texto, m.created_at,
         m.conversation_id,
         u.id     AS sender_id,
-        COALESCE(u.apodo, u.nombre) AS sender_nombre,
-        u.apodo AS sender_apodo,
+        u.nombre AS sender_nombre,
         u.skin, u.border, u.avatar_bg, u.foto_url
       FROM messages m
       LEFT JOIN users u ON u.id = m.sender_id
@@ -619,8 +604,7 @@ router.get('/groups/:id/messages', auth, async (req, res) => {
       SELECT
         m.id, m.texto, m.created_at, m.conversation_id,
         u.id AS sender_id,
-        COALESCE(u.apodo, u.nombre) AS sender_nombre,
-        u.apodo AS sender_apodo, u.rol AS sender_rol,
+        u.nombre AS sender_nombre, u.rol AS sender_rol,
         u.skin, u.border, u.avatar_bg, u.foto_url
       FROM messages m
       LEFT JOIN users u ON u.id = m.sender_id

@@ -77,6 +77,14 @@ app.use((err, req, res, next) => {
   res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: 'Error interno del servidor' } });
 });
 
+// ── Fix one-time: simetrizar friendships asimétricos (datos viejos) ──────────
+require('./config/db').query(`
+  UPDATE friendships
+  SET removed_by_requester = TRUE, removed_by_addressee = TRUE
+  WHERE (removed_by_requester = TRUE AND removed_by_addressee = FALSE)
+     OR (removed_by_requester = FALSE AND removed_by_addressee = TRUE)
+`).catch(e => console.error('[startup] friendship symmetry fix failed:', e));
+
 // ── Iniciar servidor ──────────────────────────────────────────
 server.listen(PORT, () => {
   console.log(`Aubank API corriendo en http://localhost:${PORT}`);
