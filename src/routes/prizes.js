@@ -5,44 +5,91 @@ const auth  = require('../middleware/auth');
 const roles = require('../middleware/roles');
 
 // ── Migrations ───────────────────────────────────────────────
-db.query(`
-  CREATE TABLE IF NOT EXISTS ranking_prize_sets (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    periodo TEXT NOT NULL,
-    puesto INT NOT NULL,
-    puesto_hasta INT,
-    activo BOOLEAN DEFAULT TRUE,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-  );
-  CREATE TABLE IF NOT EXISTS ranking_prize_items (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    prize_set_id UUID REFERENCES ranking_prize_sets(id) ON DELETE CASCADE,
-    tipo TEXT NOT NULL,
-    valor JSONB,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-  );
-  CREATE TABLE IF NOT EXISTS ranking_prizes_granted (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-    prize_set_id UUID,
-    periodo TEXT,
-    puesto INT,
-    premio_data JSONB,
-    granted_by TEXT,
-    granted_at TIMESTAMPTZ DEFAULT NOW()
-  );
-  CREATE TABLE IF NOT EXISTS prize_schedules (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    periodo TEXT UNIQUE NOT NULL,
-    hora TIME DEFAULT '18:00:00',
-    dia_semana INT DEFAULT 5,
-    dia_mes INT DEFAULT 1,
-    activo BOOLEAN DEFAULT FALSE,
-    ultima_ejecucion TIMESTAMPTZ
-  );
-  INSERT INTO prize_schedules (periodo) VALUES ('daily'),('weekly'),('monthly')
-    ON CONFLICT (periodo) DO NOTHING;
-`).catch(()=>{});
+(async () => {
+  try {
+    // Ensure all prize-related tables exist
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS earned_titles (
+        id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        name        VARCHAR(100) NOT NULL,
+        rarity      VARCHAR(20) NOT NULL DEFAULT 'common',
+        color       VARCHAR(30) DEFAULT '#ffffff',
+        glow_color  VARCHAR(30) DEFAULT NULL,
+        emoji       VARCHAR(20) DEFAULT NULL,
+        note        TEXT DEFAULT NULL,
+        granted_by  UUID REFERENCES users(id),
+        expires_at  TIMESTAMPTZ DEFAULT NULL,
+        created_at  TIMESTAMPTZ DEFAULT NOW()
+      );
+      ALTER TABLE earned_titles ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ DEFAULT NULL;
+      ALTER TABLE earned_titles ADD COLUMN IF NOT EXISTS glow_color VARCHAR(30) DEFAULT NULL;
+      ALTER TABLE earned_titles ADD COLUMN IF NOT EXISTS emoji VARCHAR(20) DEFAULT NULL;
+
+      CREATE TABLE IF NOT EXISTS loaned_items (
+        id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        type        VARCHAR(30) NOT NULL,
+        item_data   JSONB NOT NULL DEFAULT '{}',
+        note        TEXT,
+        expires_at  TIMESTAMPTZ DEFAULT NULL,
+        granted_by  UUID REFERENCES users(id),
+        active      BOOLEAN DEFAULT TRUE,
+        created_at  TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS notifications (
+        id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        tipo       VARCHAR(50) NOT NULL DEFAULT 'info',
+        titulo     TEXT NOT NULL,
+        cuerpo     TEXT,
+        leida      BOOLEAN DEFAULT FALSE,
+        data       JSONB DEFAULT '{}',
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS ranking_prize_sets (
+        id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        periodo    TEXT NOT NULL,
+        puesto     INT NOT NULL,
+        puesto_hasta INT,
+        activo     BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS ranking_prize_items (
+        id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        prize_set_id UUID REFERENCES ranking_prize_sets(id) ON DELETE CASCADE,
+        tipo         TEXT NOT NULL,
+        valor        JSONB,
+        created_at   TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS ranking_prizes_granted (
+        id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id      UUID REFERENCES users(id) ON DELETE CASCADE,
+        prize_set_id UUID,
+        periodo      TEXT,
+        puesto       INT,
+        premio_data  JSONB,
+        granted_by   TEXT,
+        granted_at   TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS prize_schedules (
+        id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        periodo          TEXT UNIQUE NOT NULL,
+        hora             TIME DEFAULT '18:00:00',
+        dia_semana       INT DEFAULT 5,
+        dia_mes          INT DEFAULT 1,
+        activo           BOOLEAN DEFAULT FALSE,
+        ultima_ejecucion TIMESTAMPTZ
+      );
+      INSERT INTO prize_schedules (periodo) VALUES ('daily'),('weekly'),('monthly')
+        ON CONFLICT (periodo) DO NOTHING;
+    `);
+  } catch(e) {
+    console.warn('[prizes migration]', e.message);
+  }
+})();
 
 // ── GET /prizes/sets — listar todos los prize sets con sus ítems ──
 router.get('/sets', auth, roles('admin'), async (req, res) => {
@@ -197,6 +244,8 @@ router.get('/history', auth, roles('admin'), async (req, res) => {
 async function grantPrize(userId, { tipo, valor }, grantedBy) {
   const { getTreasuryAccountId, getBalance } = require('../services/balance');
   const { v4: uuidv4 } = require('uuid');
+  // 'system' is not a valid UUID — use null for system-initiated grants
+  const granterUUID = (grantedBy && grantedBy !== 'system') ? grantedBy : null;
 
   switch(tipo) {
 
@@ -213,7 +262,7 @@ async function grantPrize(userId, { tipo, valor }, grantedBy) {
         const txId = uuidv4();
         await client.query(
           `INSERT INTO transactions (id,type,description,initiated_by) VALUES ($1,'reward',$2,$3)`,
-          [txId, `Premio: ${valor.motivo||'Premio de ranking'}`, grantedBy]);
+          [txId, `Premio: ${valor.motivo||'Premio de ranking'}`, granterUUID]);
         await client.query(
           `INSERT INTO ledger_entries (transaction_id,account_id,amount) VALUES ($1,$2,$3),($1,$4,$5)`,
           [txId, treasury, -cantidad, accs[0].id, cantidad]);
@@ -221,6 +270,10 @@ async function grantPrize(userId, { tipo, valor }, grantedBy) {
         await client.query('COMMIT');
       } catch(e) { await client.query('ROLLBACK'); throw e; }
       finally { client.release(); }
+      await notifyUser(userId, {
+        tipo: 'premio_monedas',
+        mensaje: `¡Recibiste 🪙${cantidad} monedas como premio!${valor.motivo ? ` (${valor.motivo})` : ''}`
+      });
       break;
     }
 
@@ -232,7 +285,7 @@ async function grantPrize(userId, { tipo, valor }, grantedBy) {
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
         [userId, valor.name, valor.rarity||'common', valor.color||'#ffffff',
          valor.glow_color||null, valor.emoji||null,
-         valor.note||`Premio puesto ${valor.puesto||'?'} del ranking`, grantedBy, expiresAt]);
+         valor.note||`Premio puesto ${valor.puesto||'?'} del ranking`, granterUUID, expiresAt]);
       // Notificar alumno
       await notifyUser(userId, {
         tipo: 'titulo_otorgado',
@@ -246,17 +299,17 @@ async function grantPrize(userId, { tipo, valor }, grantedBy) {
     case 'borde': {
       const expiresAt = valor.expires_days
         ? new Date(Date.now() + valor.expires_days * 86400000).toISOString() : null;
-      // Unlock border for the user (or loan it)
+      // Always insert into loaned_items so it appears in Mis Premios
+      // If permanent, also add to unlocked_borders for immediate shop access
+      await db.query(
+        `INSERT INTO loaned_items (user_id,type,item_data,note,expires_at,granted_by)
+         VALUES ($1,'border',$2,$3,$4,$5)`,
+        [userId, JSON.stringify({id:valor.item_id,name:valor.name||valor.item_id}),
+         valor.note||'Premio de ranking', expiresAt, granterUUID]);
       if (!valor.expires_days) {
         await db.query(
           `UPDATE users SET unlocked_borders=array_append(unlocked_borders,$1) WHERE id=$2 AND NOT ($1=ANY(unlocked_borders))`,
-          [valor.item_id, userId]);
-      } else {
-        await db.query(
-          `INSERT INTO loaned_items (user_id,type,item_data,note,expires_at,granted_by)
-           VALUES ($1,'border',$2,$3,$4,$5)`,
-          [userId, JSON.stringify({id:valor.item_id,name:valor.name}),
-           valor.note||'Premio de ranking', expiresAt, grantedBy]);
+          [valor.item_id, userId]).catch(()=>{});
       }
       await notifyUser(userId, { tipo: 'premio', mensaje: `¡Ganaste el borde "${valor.name||valor.item_id}"!` });
       break;
@@ -265,18 +318,17 @@ async function grantPrize(userId, { tipo, valor }, grantedBy) {
     case 'skin': {
       const expiresAtSkin = valor.expires_days
         ? new Date(Date.now() + valor.expires_days * 86400000).toISOString() : null;
-      if (!expiresAtSkin) {
-        // Permanente → va a unlocked_skins
+      // Always insert into loaned_items so it appears in Mis Premios
+      // If permanent, also add to unlocked_skins for immediate shop access
+      await db.query(
+        `INSERT INTO loaned_items (user_id,type,item_data,note,expires_at,granted_by)
+         VALUES ($1,'skin',$2,$3,$4,$5)`,
+        [userId, JSON.stringify({id:valor.item_id,name:valor.name||valor.item_id}),
+         valor.note||'Premio de ranking', expiresAtSkin, granterUUID]);
+      if (!valor.expires_days) {
         await db.query(
           `UPDATE users SET unlocked_skins=array_append(unlocked_skins,$1) WHERE id=$2 AND NOT ($1=ANY(unlocked_skins))`,
-          [valor.item_id, userId]);
-      } else {
-        // Temporal → va a loaned_items
-        await db.query(
-          `INSERT INTO loaned_items (user_id,type,item_data,note,expires_at,granted_by)
-           VALUES ($1,'skin',$2,$3,$4,$5)`,
-          [userId, JSON.stringify({id:valor.item_id,name:valor.name}),
-           valor.note||'Premio', expiresAtSkin, grantedBy]);
+          [valor.item_id, userId]).catch(()=>{});
       }
       await notifyUser(userId, { tipo: 'premio', mensaje: `¡Ganaste la skin "${valor.name||valor.item_id}"!` });
       break;
@@ -289,8 +341,8 @@ async function grantPrize(userId, { tipo, valor }, grantedBy) {
         `INSERT INTO loaned_items (user_id,type,item_data,note,expires_at,granted_by)
          VALUES ($1,'avatar_bg',$2,$3,$4,$5)`,
         [userId, JSON.stringify({id:'loaned_'+Date.now(),name:valor.name,type:valor.type||'frame',value:valor.value,glow:valor.glow||null}),
-         valor.note||'Premio de ranking', expiresAt, grantedBy]);
-      await notifyUser(userId, { tipo: 'premio', mensaje: `¡Ganaste el marco "${valor.name}"!` });
+         valor.note||'Premio de ranking', expiresAt, granterUUID]);
+      await notifyUser(userId, { tipo: 'premio', mensaje: `¡Ganaste el marco "${valor.name||'marco'}"!` });
       break;
     }
 
@@ -301,8 +353,8 @@ async function grantPrize(userId, { tipo, valor }, grantedBy) {
       await db.query(
         `INSERT INTO loaned_items (user_id,type,item_data,note,expires_at,granted_by)
          VALUES ($1,'name_color',$2,$3,$4,$5)`,
-        [userId, JSON.stringify({item_id:valor.item_id,name:valor.name}),
-         valor.note||'Premio de ranking', expiresAt, grantedBy]);
+        [userId, JSON.stringify({item_id:valor.item_id,name:valor.name,color:valor.color,config:valor.config}),
+         valor.note||'Premio de ranking', expiresAt, granterUUID]);
       await notifyUser(userId, { tipo: 'premio', mensaje: `¡Ganaste el color de nombre "${valor.name}"!` });
       break;
     }
