@@ -4,6 +4,46 @@ const db      = require('../config/db');
 const auth  = require('../middleware/auth');
 const roles = require('../middleware/roles');
 
+// ── Migrations ───────────────────────────────────────────────
+db.query(`
+  CREATE TABLE IF NOT EXISTS ranking_prize_sets (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    periodo TEXT NOT NULL,
+    puesto INT NOT NULL,
+    puesto_hasta INT,
+    activo BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  );
+  CREATE TABLE IF NOT EXISTS ranking_prize_items (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    prize_set_id UUID REFERENCES ranking_prize_sets(id) ON DELETE CASCADE,
+    tipo TEXT NOT NULL,
+    valor JSONB,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  );
+  CREATE TABLE IF NOT EXISTS ranking_prizes_granted (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    prize_set_id UUID,
+    periodo TEXT,
+    puesto INT,
+    premio_data JSONB,
+    granted_by TEXT,
+    granted_at TIMESTAMPTZ DEFAULT NOW()
+  );
+  CREATE TABLE IF NOT EXISTS prize_schedules (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    periodo TEXT UNIQUE NOT NULL,
+    hora TIME DEFAULT '18:00:00',
+    dia_semana INT DEFAULT 5,
+    dia_mes INT DEFAULT 1,
+    activo BOOLEAN DEFAULT FALSE,
+    ultima_ejecucion TIMESTAMPTZ
+  );
+  INSERT INTO prize_schedules (periodo) VALUES ('daily'),('weekly'),('monthly')
+    ON CONFLICT (periodo) DO NOTHING;
+`).catch(()=>{});
+
 // ── GET /prizes/sets — listar todos los prize sets con sus ítems ──
 router.get('/sets', auth, roles('admin'), async (req, res) => {
   try {
@@ -107,26 +147,24 @@ router.post('/execute/:periodo', auth, roles('admin'), async (req, res) => {
         targetAlumnos = ranking.slice(set.puesto - 1, set.puesto_hasta);
       }
       if (!targetAlumnos.length) continue;
+      const items = typeof set.items === 'string' ? JSON.parse(set.items) : (set.items || []);
       for (const alumno of targetAlumnos) {
-      const items = typeof set.items === 'string' ? JSON.parse(set.items) : set.items;
-      for (const item of items) {
-        try {
-          const valor = typeof item.valor === 'string' ? JSON.parse(item.valor) : item.valor;
-          await grantPrize(alumno.id, { tipo: item.tipo, valor }, 'system');
-          results.push({ puesto: set.puesto, alumno: alumno.nombre, tipo: item.tipo, ok: true });
-        } catch(e) {
-          results.push({ puesto: set.puesto, alumno: alumno.nombre, tipo: item.tipo, ok: false, error: e.message });
+        for (const item of items) {
+          try {
+            const valor = typeof item.valor === 'string' ? JSON.parse(item.valor) : item.valor;
+            await grantPrize(alumno.id, { tipo: item.tipo, valor }, 'system');
+            results.push({ puesto: set.puesto, alumno: alumno.nombre, tipo: item.tipo, ok: true });
+          } catch(e) {
+            results.push({ puesto: set.puesto, alumno: alumno.nombre, tipo: item.tipo, ok: false, error: e.message });
+          }
         }
-      }
       } // end for alumno
       // Registrar en historial (una vez por set)
-      if (targetAlumnos.length > 0) {
-        await db.query(
-          `INSERT INTO ranking_prizes_granted (user_id, prize_set_id, periodo, puesto, premio_data, granted_by)
-           VALUES ($1,$2,$3,$4,$5,'system')`,
-          [targetAlumnos[0].id, set.id, periodo, set.puesto, JSON.stringify({ items, count: targetAlumnos.length })]
-        ).catch(()=>{});
-      }
+      await db.query(
+        `INSERT INTO ranking_prizes_granted (user_id, prize_set_id, periodo, puesto, premio_data, granted_by)
+         VALUES ($1,$2,$3,$4,$5,'system')`,
+        [targetAlumnos[0].id, set.id, periodo, set.puesto, JSON.stringify({ items, count: targetAlumnos.length })]
+      ).catch(()=>{});
     }
 
     // Actualizar ultima_ejecucion

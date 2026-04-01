@@ -478,7 +478,7 @@ router.post('/bank-revert', auth, roles('admin'), async (req, res) => {
 router.post('/tax', auth, roles('admin'), async (req, res) => {
   const client = await db.getClient();
   try {
-    const { recipients, classroom_id, amount, motivo, periodicidad='unico' } = req.body;
+    const { recipients, classroom_id, amount, motivo, periodicidad='unico', dias } = req.body;
     if (!recipients || !amount || amount <= 0 || !motivo)
       return res.status(400).json({ ok: false, error: { code: 'MISSING_FIELDS' } });
 
@@ -525,7 +525,7 @@ router.post('/tax', auth, roles('admin'), async (req, res) => {
           // Notificación persistente
           await client.query(`INSERT INTO notifications (user_id,tipo,titulo,cuerpo,data) VALUES ($1,'tax',$2,$3,$4)`,
             [uid, `Impuesto aplicado: -🪙${cobrar}`,
-             `Motivo: ${motivo}${periodicidad!=='unico'?` (${periodicidad})`:''}`,
+             `Motivo: ${motivo}${periodicidad!=='unico'?` (${periodicidad}${dias?`, ${dias} días`:''})` :''}`,
              JSON.stringify({ amount: cobrar, motivo, periodicidad })]);
         }
 
