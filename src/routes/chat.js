@@ -821,4 +821,58 @@ router.patch('/groups/:id/settings', auth, async (req, res) => {
   }
 });
 
+// ── Parent chat (tabla simple, sin rooms) ─────────────────────
+// Startup migration
+db.query(`
+  CREATE TABLE IF NOT EXISTS parent_messages (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id    UUID REFERENCES users(id) ON DELETE CASCADE,
+    texto      TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )
+`).catch(e => console.warn('[chat] parent_messages table:', e.message));
+
+// GET /chat/parent-messages — últimos 50 mensajes del chat de padres
+router.get('/parent-messages', auth, async (req, res) => {
+  try {
+    const { rows } = await db.query(`
+      SELECT pm.id, pm.texto, pm.created_at,
+             u.id AS user_id, u.nombre, u.apodo, u.avatar_bg, u.skin
+      FROM parent_messages pm
+      JOIN users u ON u.id = pm.user_id
+      ORDER BY pm.created_at ASC
+      LIMIT 50
+    `);
+    res.json({ ok: true, data: rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// POST /chat/parent-messages — enviar mensaje al chat de padres
+router.post('/parent-messages', auth, async (req, res) => {
+  try {
+    const { texto } = req.body;
+    if (!texto || !texto.trim())
+      return res.status(400).json({ ok: false, error: { code: 'EMPTY_MESSAGE', message: 'El mensaje no puede estar vacío' } });
+
+    const { rows } = await db.query(
+      `INSERT INTO parent_messages (user_id, texto) VALUES ($1, $2) RETURNING id, texto, created_at`,
+      [req.user.id, texto.trim().substring(0, 500)]
+    );
+    const msg = { ...rows[0], user_id: req.user.id, nombre: req.user.nombre, apodo: req.user.apodo };
+
+    // Broadcast via socket
+    try {
+      const { getIO } = require('../socket');
+      const io = getIO();
+      if (io) io.emit('parent_message', msg);
+    } catch(e) {}
+
+    res.status(201).json({ ok: true, data: msg });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 module.exports = router;

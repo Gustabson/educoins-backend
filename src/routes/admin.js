@@ -738,4 +738,97 @@ router.patch('/proposals/:id', async (req, res) => {
   }
 });
 
+// ── GET /admin/link-requests ──────────────────────────────────
+// Todas las solicitudes de vinculación con info del padre y alumno
+db.query(`
+  CREATE TABLE IF NOT EXISTS parent_link_requests (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    parent_id  UUID REFERENCES users(id) ON DELETE CASCADE,
+    student_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    student_name TEXT,
+    estado     TEXT DEFAULT 'pendiente' CHECK(estado IN('pendiente','aprobado','rechazado')),
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  )
+`).catch(e => console.warn('[admin] parent_link_requests table:', e.message));
+
+router.get('/link-requests', async (req, res) => {
+  try {
+    const { rows } = await db.query(`
+      SELECT r.id, r.estado, r.created_at, r.student_name,
+             p.id AS parent_id, p.nombre AS parent_nombre, p.email AS parent_email,
+             s.id AS student_id, s.nombre AS student_nombre
+      FROM parent_link_requests r
+      JOIN users p ON p.id = r.parent_id
+      LEFT JOIN users s ON s.id = r.student_id
+      ORDER BY r.created_at DESC
+    `);
+    res.json({ ok: true, data: rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// ── PATCH /admin/link-requests/:id/approve ───────────────────
+router.patch('/link-requests/:id/approve', async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      "SELECT * FROM parent_link_requests WHERE id=$1", [req.params.id]
+    );
+    if (!rows.length)
+      return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND' } });
+    const request = rows[0];
+
+    await db.query(
+      "UPDATE parent_link_requests SET estado='aprobado' WHERE id=$1", [req.params.id]
+    );
+    // Crear vínculo real
+    if (request.student_id) {
+      await db.query(
+        `INSERT INTO parent_student_links (parent_id, student_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+        [request.parent_id, request.student_id]
+      );
+    }
+    // Notificar al padre via socket
+    try {
+      const { getIO } = require('../socket');
+      const io = getIO();
+      if (io) io.to(`user:${request.parent_id}`).emit('notification', {
+        type: 'link_approved', student_id: request.student_id, message: 'Tu solicitud de vinculación fue aprobada'
+      });
+    } catch(e) {}
+
+    res.json({ ok: true, data: { message: 'Solicitud aprobada y vínculo creado' } });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// ── PATCH /admin/link-requests/:id/reject ────────────────────
+router.patch('/link-requests/:id/reject', async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      "SELECT * FROM parent_link_requests WHERE id=$1", [req.params.id]
+    );
+    if (!rows.length)
+      return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND' } });
+    const request = rows[0];
+
+    await db.query(
+      "UPDATE parent_link_requests SET estado='rechazado' WHERE id=$1", [req.params.id]
+    );
+    // Notificar al padre
+    try {
+      const { getIO } = require('../socket');
+      const io = getIO();
+      if (io) io.to(`user:${request.parent_id}`).emit('notification', {
+        type: 'link_rejected', message: 'Tu solicitud de vinculación fue rechazada'
+      });
+    } catch(e) {}
+
+    res.json({ ok: true, data: { message: 'Solicitud rechazada' } });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 module.exports = router;
