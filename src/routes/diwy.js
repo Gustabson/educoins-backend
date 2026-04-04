@@ -91,6 +91,41 @@ router.get('/students', auth, roles('admin', 'teacher'), async (req, res) => {
     `);
     res.json({ ok: true, data: rows });
   } catch (e) {
+    // 42P01 = tabla no existe aún (primera vez en Railway antes de migration)
+    if (e.code === '42P01') {
+      try {
+        // Intentar crear la tabla y devolver alumnos sin datos de reporte
+        await db.query(`
+          CREATE TABLE IF NOT EXISTS diwy_reports (
+            id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            student_id       UUID REFERENCES users(id) ON DELETE CASCADE,
+            generated_by     UUID REFERENCES users(id) ON DELETE SET NULL,
+            periodo_label    TEXT,
+            data_snapshot    JSONB,
+            reporte_ia       TEXT,
+            reporte_final    TEXT,
+            estado           TEXT CHECK (estado IN ('draft','pendiente_revision','aprobado')) DEFAULT 'draft',
+            approved_by      UUID REFERENCES users(id) ON DELETE SET NULL,
+            approved_at      TIMESTAMPTZ,
+            created_at       TIMESTAMPTZ DEFAULT NOW()
+          )
+        `);
+        const { rows: fallback } = await db.query(`
+          SELECT id, nombre, balance,
+            NULL::uuid AS last_report_id,
+            NULL::text AS last_report_estado,
+            NULL::timestamptz AS last_report_at,
+            NULL::text AS periodo_label
+          FROM users
+          WHERE rol = 'student' AND activo = TRUE
+          ORDER BY nombre ASC
+        `);
+        return res.json({ ok: true, data: fallback });
+      } catch (e2) {
+        console.error('[diwy] GET /students fallback:', e2);
+        return res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: e2.message } });
+      }
+    }
     console.error('[diwy] GET /students:', e);
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: e.message } });
   }
