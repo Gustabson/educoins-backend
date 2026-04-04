@@ -31,6 +31,16 @@ db.query(`
   )
 `).catch(e => console.warn('[admin] admin_proposals table:', e.message));
 
+db.query(`
+  CREATE TABLE IF NOT EXISTS parent_student_links (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    parent_id  UUID REFERENCES users(id) ON DELETE CASCADE,
+    student_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(parent_id, student_id)
+  )
+`).catch(e => console.warn('[admin] parent_student_links table:', e.message));
+
 // ── GET /api/v1/admin/users ───────────────────────────────────
 router.get('/users', async (req, res) => {
   try {
