@@ -91,6 +91,14 @@ require('./config/db').query(`
      OR (removed_by_requester = FALSE AND removed_by_addressee = TRUE)
 `).catch(e => console.error('[startup] friendship symmetry fix failed:', e));
 
+// ── Migración: ampliar CHECK constraint de users.rol para incluir parent/staff ─
+require('./config/db').query(`
+  ALTER TABLE users
+    DROP CONSTRAINT IF EXISTS users_rol_check,
+    ADD CONSTRAINT users_rol_check
+      CHECK (rol IN ('student','teacher','admin','parent','staff'))
+`).catch(e => console.error('[startup] users_rol_check migration:', e.message));
+
 // ── Iniciar servidor ──────────────────────────────────────────
 server.listen(PORT, () => {
   console.log(`Aubank API corriendo en http://localhost:${PORT}`);
