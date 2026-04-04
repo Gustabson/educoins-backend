@@ -65,6 +65,7 @@ app.use('/api/v1/staff',        require('./routes/staff'));
 app.use('/api/v1/verdicts',     require('./routes/verdicts'));
 app.use('/api/v1/ai',           require('./routes/ai'));
 app.use('/api/v1/ai-docs',      require('./routes/ai-docs'));
+app.use('/api/v1/diwy',         require('./routes/diwy'));
 
 // ── Health check ──────────────────────────────────────────────
 app.get('/health', (req, res) => {
