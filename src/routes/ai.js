@@ -9,8 +9,18 @@ const auth    = require('../middleware/auth');
 const roles   = require('../middleware/roles');
 const router  = express.Router();
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const MODEL  = 'gpt-4.1-mini';
+// Inicialización lazy — evita crash si OPENAI_API_KEY no está seteada en Railway
+let _openai = null;
+function getOpenAI() {
+  if (!process.env.OPENAI_API_KEY) {
+    const err = new Error('OPENAI_API_KEY no está configurada en las variables de entorno del servidor');
+    err.code = 'NO_API_KEY';
+    throw err;
+  }
+  if (!_openai) _openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  return _openai;
+}
+const MODEL = 'gpt-4.1-mini';
 
 // ── Startup: tabla de logs ────────────────────────────────────
 db.query(`
@@ -109,7 +119,7 @@ ${regDoc  ? `[REGLAMENTO — ${regDoc.titulo}]:\n${regDoc.contenido}` : ''}
 
 ${instDoc ? `[INSTITUCIONAL — ${instDoc.titulo}]:\n${instDoc.contenido}` : ''}`;
 
-    const completion = await openai.chat.completions.create({
+    const completion = await getOpenAI().chat.completions.create({
       model: MODEL,
       temperature: 0.2,
       max_tokens: 400,
@@ -132,7 +142,10 @@ ${instDoc ? `[INSTITUCIONAL — ${instDoc.titulo}]:\n${instDoc.contenido}` : ''}
 
   } catch (err) {
     console.error('[ai] /query:', err);
-    res.status(500).json({ ok: false, error: { code: 'AI_ERROR', message: 'Error al consultar la IA. Intentá de nuevo.' } });
+    const msg = err.code === 'NO_API_KEY'
+      ? 'El Asistente IA no está configurado aún. Contactá a la administración.'
+      : 'Error al consultar la IA. Intentá de nuevo.';
+    res.status(500).json({ ok: false, error: { code: err.code || 'AI_ERROR', message: msg } });
   }
 });
 
@@ -171,7 +184,7 @@ Respondé ÚNICAMENTE con JSON válido y sin texto adicional:
   "nota_para_admin": "observaciones adicionales o advertencias para el administrador"
 }`;
 
-    const completion = await openai.chat.completions.create({
+    const completion = await getOpenAI().chat.completions.create({
       model: MODEL,
       temperature: 0,
       max_tokens: 700,
@@ -200,7 +213,10 @@ Respondé ÚNICAMENTE con JSON válido y sin texto adicional:
 
   } catch (err) {
     console.error('[ai] /verdict-suggest:', err);
-    res.status(500).json({ ok: false, error: { code: 'AI_ERROR', message: 'Error al consultar la IA. Intentá de nuevo.' } });
+    const msg = err.code === 'NO_API_KEY'
+      ? 'El Asistente IA no está configurado aún. Agregá OPENAI_API_KEY en Railway.'
+      : 'Error al consultar la IA. Intentá de nuevo.';
+    res.status(500).json({ ok: false, error: { code: err.code || 'AI_ERROR', message: msg } });
   }
 });
 
