@@ -821,8 +821,162 @@ router.patch('/groups/:id/settings', auth, async (req, res) => {
   }
 });
 
-// ── Parent chat (tabla simple, sin rooms) ─────────────────────
-// Startup migration
+// ── Parent chat — global_parents & classroom_parents via conversations ──
+
+// Helper: get/create global_parents conversation
+async function getOrCreateParentGlobalConv() {
+  const { rows } = await db.query(
+    "SELECT id FROM conversations WHERE type = 'global_parents' LIMIT 1"
+  );
+  if (rows.length > 0) return rows[0].id;
+  const { rows: c } = await db.query(
+    "INSERT INTO conversations (type) VALUES ('global_parents') RETURNING id"
+  );
+  return c[0].id;
+}
+
+// Helper: get/create classroom_parents conversation for a given classroom
+async function getOrCreateParentClassroomConv(classroomId) {
+  const { rows } = await db.query(
+    "SELECT id FROM conversations WHERE type = 'classroom_parents' AND classroom_id = $1 LIMIT 1",
+    [classroomId]
+  );
+  if (rows.length > 0) return rows[0].id;
+  const { rows: c } = await db.query(
+    "INSERT INTO conversations (type, classroom_id) VALUES ('classroom_parents', $1) RETURNING id",
+    [classroomId]
+  );
+  return c[0].id;
+}
+
+// GET /chat/parent-global/info
+router.get('/parent-global/info', auth, async (req, res) => {
+  try {
+    const convId = await getOrCreateParentGlobalConv();
+    await db.query(
+      'INSERT INTO conversation_members (conversation_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING',
+      [convId, req.user.id]
+    );
+    res.json({ ok: true, data: { conversation_id: convId } });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// GET /chat/parent-global/messages
+router.get('/parent-global/messages', auth, async (req, res) => {
+  try {
+    const convId = await getOrCreateParentGlobalConv();
+    await db.query(
+      'INSERT INTO conversation_members (conversation_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING',
+      [convId, req.user.id]
+    );
+    const before = req.query.before || null;
+    const { rows } = await db.query(`
+      SELECT m.id, m.texto, m.created_at, m.conversation_id,
+             u.id AS sender_id, COALESCE(u.apodo, u.nombre) AS sender_nombre,
+             u.rol AS sender_rol, u.skin, u.border, u.avatar_bg, u.foto_url
+      FROM messages m
+      LEFT JOIN users u ON u.id = m.sender_id
+      WHERE m.conversation_id = $1
+        AND ($2::timestamptz IS NULL OR m.created_at < $2)
+      ORDER BY m.created_at DESC LIMIT $3
+    `, [convId, before, MSG_LIMIT]);
+    await db.query(`
+      INSERT INTO conversation_members (conversation_id, user_id, last_read_at)
+      VALUES ($1,$2,NOW()) ON CONFLICT (conversation_id,user_id) DO UPDATE SET last_read_at=NOW()
+    `, [convId, req.user.id]);
+    res.json({ ok: true, data: { messages: rows.reverse(), conversation_id: convId } });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// GET /chat/parent-classroom/info — classroom de los hijos del padre
+router.get('/parent-classroom/info', auth, async (req, res) => {
+  try {
+    const { rows: cls } = await db.query(`
+      SELECT DISTINCT cl.id, cl.nombre
+      FROM parent_student_links psl
+      JOIN classroom_members cm ON cm.user_id = psl.student_id
+      JOIN classrooms cl ON cl.id = cm.classroom_id AND cl.activa = TRUE
+      WHERE psl.parent_id = $1
+      LIMIT 1
+    `, [req.user.id]);
+    if (cls.length === 0) return res.json({ ok: true, data: null });
+    const convId = await getOrCreateParentClassroomConv(cls[0].id);
+    await db.query(
+      'INSERT INTO conversation_members (conversation_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING',
+      [convId, req.user.id]
+    );
+    res.json({ ok: true, data: { id: cls[0].id, nombre: cls[0].nombre, conversation_id: convId } });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// GET /chat/parent-classroom/messages
+router.get('/parent-classroom/messages', auth, async (req, res) => {
+  try {
+    const { rows: cls } = await db.query(`
+      SELECT DISTINCT cl.id
+      FROM parent_student_links psl
+      JOIN classroom_members cm ON cm.user_id = psl.student_id
+      JOIN classrooms cl ON cl.id = cm.classroom_id AND cl.activa = TRUE
+      WHERE psl.parent_id = $1 LIMIT 1
+    `, [req.user.id]);
+    if (cls.length === 0) {
+      return res.status(403).json({ ok: false, error: { code: 'NO_CLASSROOM', message: 'No tenés hijos en ningún aula' } });
+    }
+    const convId = await getOrCreateParentClassroomConv(cls[0].id);
+    const before = req.query.before || null;
+    const { rows } = await db.query(`
+      SELECT m.id, m.texto, m.created_at, m.conversation_id,
+             u.id AS sender_id, COALESCE(u.apodo, u.nombre) AS sender_nombre,
+             u.rol AS sender_rol, u.skin, u.border, u.avatar_bg, u.foto_url
+      FROM messages m
+      LEFT JOIN users u ON u.id = m.sender_id
+      WHERE m.conversation_id = $1
+        AND ($2::timestamptz IS NULL OR m.created_at < $2)
+      ORDER BY m.created_at DESC LIMIT $3
+    `, [convId, before, MSG_LIMIT]);
+    await db.query(`
+      INSERT INTO conversation_members (conversation_id, user_id, last_read_at)
+      VALUES ($1,$2,NOW()) ON CONFLICT (conversation_id,user_id) DO UPDATE SET last_read_at=NOW()
+    `, [convId, req.user.id]);
+    res.json({ ok: true, data: { messages: rows.reverse(), conversation_id: convId } });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// GET /chat/parent-users/search — buscar solo padres
+router.get('/parent-users/search', auth, async (req, res) => {
+  try {
+    const q = (req.query.q || '').trim();
+    if (q.length < 2) return res.json({ ok: true, data: [] });
+    const { rows } = await db.query(`
+      SELECT u.id, u.nombre, u.apodo, u.rol, u.skin, u.border, u.avatar_bg, u.foto_url,
+             f.estado AS friendship_estado, f.id AS friendship_id
+      FROM users u
+      LEFT JOIN friendships f ON
+        ((f.requester_id = $1 AND f.addressee_id = u.id) OR
+         (f.addressee_id = $1 AND f.requester_id = u.id))
+        AND NOT (f.removed_by_requester AND f.removed_by_addressee)
+      WHERE u.id <> $1
+        AND u.activo = TRUE
+        AND u.rol = 'padre'
+        AND (u.nombre ILIKE $2 OR u.apodo ILIKE $2)
+      ORDER BY COALESCE(u.apodo, u.nombre)
+      LIMIT 15
+    `, [req.user.id, `%${q}%`]);
+    res.json({ ok: true, data: rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// Legacy parent_messages — kept for backwards compat
 db.query(`
   CREATE TABLE IF NOT EXISTS parent_messages (
     id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -831,48 +985,5 @@ db.query(`
     created_at TIMESTAMPTZ DEFAULT NOW()
   )
 `).catch(e => console.warn('[chat] parent_messages table:', e.message));
-
-// GET /chat/parent-messages — últimos 50 mensajes del chat de padres
-router.get('/parent-messages', auth, async (req, res) => {
-  try {
-    const { rows } = await db.query(`
-      SELECT pm.id, pm.texto, pm.created_at,
-             u.id AS user_id, u.nombre, u.apodo, u.avatar_bg, u.skin
-      FROM parent_messages pm
-      JOIN users u ON u.id = pm.user_id
-      ORDER BY pm.created_at ASC
-      LIMIT 50
-    `);
-    res.json({ ok: true, data: rows });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
-  }
-});
-
-// POST /chat/parent-messages — enviar mensaje al chat de padres
-router.post('/parent-messages', auth, async (req, res) => {
-  try {
-    const { texto } = req.body;
-    if (!texto || !texto.trim())
-      return res.status(400).json({ ok: false, error: { code: 'EMPTY_MESSAGE', message: 'El mensaje no puede estar vacío' } });
-
-    const { rows } = await db.query(
-      `INSERT INTO parent_messages (user_id, texto) VALUES ($1, $2) RETURNING id, texto, created_at`,
-      [req.user.id, texto.trim().substring(0, 500)]
-    );
-    const msg = { ...rows[0], user_id: req.user.id, nombre: req.user.nombre, apodo: req.user.apodo };
-
-    // Broadcast via socket
-    try {
-      const { getIO } = require('../socket');
-      const io = getIO();
-      if (io) io.emit('parent_message', msg);
-    } catch(e) {}
-
-    res.status(201).json({ ok: true, data: msg });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
-  }
-});
 
 module.exports = router;
