@@ -1,6 +1,6 @@
 // src/routes/verdicts.js
-// Canal de veredictos del superadmin → alumnos.
-// Solo el superadmin puede enviar veredictos.
+// Canal de veredictos del admin → alumnos.
+// Solo admin puede emitir veredictos (negativos y positivos).
 // Los alumnos pueden ver y marcar como leídos los propios.
 
 const express  = require('express');
@@ -19,24 +19,30 @@ db.query(`
     mensaje        TEXT NOT NULL,
     severity       TEXT NOT NULL DEFAULT 'advertencia',
     coins_penalty  INTEGER NOT NULL DEFAULT 0,
+    coins_reward   INTEGER NOT NULL DEFAULT 0,
     read_at        TIMESTAMPTZ,
     created_at     TIMESTAMPTZ DEFAULT NOW()
   )
 `).catch(e => console.warn('[verdicts] table migration:', e.message));
 
-// ── POST / — enviar veredicto (superadmin) ────────────────────
+// Add coins_reward to existing tables that may not have the column
+db.query(`ALTER TABLE verdicts ADD COLUMN IF NOT EXISTS coins_reward INTEGER NOT NULL DEFAULT 0`)
+  .catch(e => console.warn('[verdicts] coins_reward migration:', e.message));
+
+// ── POST / — enviar veredicto (admin) ────────────────────────
 router.post('/', auth, roles('admin'), async (req, res) => {
   const client = await db.getClient();
   try {
-    const { to_user_ids, mensaje, severity = 'advertencia', coins_penalty = 0 } = req.body;
+    const { to_user_ids, mensaje, severity = 'advertencia', coins_penalty = 0, coins_reward = 0 } = req.body;
     if (!to_user_ids?.length || !mensaje?.trim()) {
       return res.status(400).json({ ok: false, error: { code: 'MISSING_FIELDS', message: 'Destinatarios y mensaje son requeridos' } });
     }
     const penalty = Math.max(0, parseInt(coins_penalty) || 0);
+    const reward  = Math.max(0, parseInt(coins_reward)  || 0);
 
-    // Obtener treasury una sola vez si hay penalización
+    // Obtain treasury once if there are economic effects
     let treasuryId = null;
-    if (penalty > 0) {
+    if (penalty > 0 || reward > 0) {
       const { rows: tr } = await client.query(
         "SELECT id FROM accounts WHERE account_type = 'treasury' AND is_active = TRUE LIMIT 1"
       );
@@ -50,65 +56,86 @@ router.post('/', auth, roles('admin'), async (req, res) => {
     for (const userId of to_user_ids) {
       await client.query('BEGIN');
       try {
-        // Insertar veredicto
         const { rows } = await client.query(`
-          INSERT INTO verdicts (from_user_id, to_user_id, mensaje, severity, coins_penalty)
-          VALUES ($1, $2, $3, $4, $5)
+          INSERT INTO verdicts (from_user_id, to_user_id, mensaje, severity, coins_penalty, coins_reward)
+          VALUES ($1, $2, $3, $4, $5, $6)
           RETURNING *
-        `, [req.user.id, userId, mensaje.trim(), severity, penalty]);
+        `, [req.user.id, userId, mensaje.trim(), severity, penalty, reward]);
 
         const verdict = rows[0];
 
-        // Aplicar penalización económica si corresponde
-        if (penalty > 0 && treasuryId) {
-          const { rows: accRows } = await client.query(
-            'SELECT id FROM accounts WHERE user_id = $1 AND is_active = TRUE LIMIT 1',
-            [userId]
+        const { rows: accRows } = await client.query(
+          'SELECT id FROM accounts WHERE user_id = $1 AND is_active = TRUE LIMIT 1',
+          [userId]
+        );
+        const userAccId = accRows[0]?.id;
+
+        // Penalización: alumno → treasury
+        if (penalty > 0 && treasuryId && userAccId) {
+          const { rows: balRows } = await client.query(
+            'SELECT COALESCE(SUM(amount), 0)::INTEGER AS bal FROM ledger_entries WHERE account_id = $1',
+            [userAccId]
           );
-          const userAccId = accRows[0]?.id;
-
-          if (userAccId) {
-            const { rows: balRows } = await client.query(
-              'SELECT COALESCE(SUM(amount), 0)::INTEGER AS bal FROM ledger_entries WHERE account_id = $1',
-              [userAccId]
+          const cobrar = Math.min(parseInt(balRows[0].bal), penalty);
+          if (cobrar > 0) {
+            const txId = uuidv4();
+            await client.query(
+              `INSERT INTO transactions (id, type, description, initiated_by, metadata)
+               VALUES ($1, 'adjustment', $2, $3, $4)`,
+              [txId,
+               `Penalización veredicto: ${mensaje.trim().substring(0, 80)}`,
+               req.user.id,
+               JSON.stringify({ verdict_id: verdict.id, severity, coins_penalty: cobrar })]
             );
-            const cobrar = Math.min(parseInt(balRows[0].bal), penalty);
-
-            if (cobrar > 0) {
-              const txId = uuidv4();
-              await client.query(
-                `INSERT INTO transactions (id, type, description, initiated_by, metadata)
-                 VALUES ($1, 'adjustment', $2, $3, $4)`,
-                [txId,
-                 `Penalización veredicto: ${mensaje.trim().substring(0, 80)}`,
-                 req.user.id,
-                 JSON.stringify({ verdict_id: verdict.id, severity, coins_penalty: cobrar })]
-              );
-              await client.query(
-                'INSERT INTO ledger_entries (id, transaction_id, account_id, amount) VALUES ($1,$2,$3,$4)',
-                [uuidv4(), txId, userAccId, -cobrar]
-              );
-              await client.query(
-                'INSERT INTO ledger_entries (id, transaction_id, account_id, amount) VALUES ($1,$2,$3,$4)',
-                [uuidv4(), txId, treasuryId, cobrar]
-              );
-            }
+            await client.query(
+              'INSERT INTO ledger_entries (id, transaction_id, account_id, amount) VALUES ($1,$2,$3,$4)',
+              [uuidv4(), txId, userAccId, -cobrar]
+            );
+            await client.query(
+              'INSERT INTO ledger_entries (id, transaction_id, account_id, amount) VALUES ($1,$2,$3,$4)',
+              [uuidv4(), txId, treasuryId, cobrar]
+            );
           }
+        }
+
+        // Recompensa: treasury → alumno
+        if (reward > 0 && treasuryId && userAccId) {
+          const txId = uuidv4();
+          await client.query(
+            `INSERT INTO transactions (id, type, description, initiated_by, metadata)
+             VALUES ($1, 'reward', $2, $3, $4)`,
+            [txId,
+             `Recompensa veredicto: ${mensaje.trim().substring(0, 80)}`,
+             req.user.id,
+             JSON.stringify({ verdict_id: verdict.id, severity, coins_reward: reward })]
+          );
+          await client.query(
+            'INSERT INTO ledger_entries (id, transaction_id, account_id, amount) VALUES ($1,$2,$3,$4)',
+            [uuidv4(), txId, treasuryId, -reward]
+          );
+          await client.query(
+            'INSERT INTO ledger_entries (id, transaction_id, account_id, amount) VALUES ($1,$2,$3,$4)',
+            [uuidv4(), txId, userAccId, reward]
+          );
         }
 
         await client.query('COMMIT');
         results.push(verdict);
 
-        // Emitir al alumno en tiempo real
         if (io) {
           io.to(`user:${userId}`).emit('new_verdict', {
-            id:            verdict.id,
-            mensaje:       verdict.mensaje,
-            severity:      verdict.severity,
+            id:           verdict.id,
+            mensaje:      verdict.mensaje,
+            severity:     verdict.severity,
             coins_penalty: verdict.coins_penalty,
-            created_at:    verdict.created_at,
-            from_nombre:   req.user.nombre,
+            coins_reward:  verdict.coins_reward,
+            created_at:   verdict.created_at,
+            from_nombre:  req.user.nombre,
           });
+          // Refresh balance if there was an economic effect
+          if (penalty > 0 || reward > 0) {
+            io.to(`user:${userId}`).emit('notification', { type: 'transfer' });
+          }
         }
 
       } catch (innerErr) {
@@ -128,7 +155,7 @@ router.post('/', auth, roles('admin'), async (req, res) => {
   }
 });
 
-// ── GET / — todos los veredictos (superadmin) ─────────────────
+// ── GET / — todos los veredictos (admin) ─────────────────────
 router.get('/', auth, roles('admin'), async (req, res) => {
   try {
     const { rows } = await db.query(`
