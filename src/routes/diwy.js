@@ -60,6 +60,34 @@ db.query(`
 `).catch(e => console.warn('[diwy] diwy_parent_requests table:', e.message));
 
 db.query(`
+  CREATE TABLE IF NOT EXISTS diwy_messages (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    parent_id       UUID REFERENCES users(id) ON DELETE CASCADE,
+    student_id      UUID REFERENCES users(id) ON DELETE CASCADE,
+    original_msg    TEXT NOT NULL,
+    formatted_msg   TEXT,
+    teacher_reply   TEXT,
+    formatted_reply TEXT,
+    teacher_id      UUID REFERENCES users(id) ON DELETE SET NULL,
+    estado          TEXT CHECK (estado IN ('pending','replied')) DEFAULT 'pending',
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    replied_at      TIMESTAMPTZ
+  )
+`).catch(e => console.warn('[diwy] diwy_messages table:', e.message));
+
+db.query(`
+  CREATE TABLE IF NOT EXISTS diwy_class_preview (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    teacher_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    fecha      DATE NOT NULL DEFAULT CURRENT_DATE,
+    tema       TEXT NOT NULL,
+    detalle    TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (fecha)
+  )
+`).catch(e => console.warn('[diwy] diwy_class_preview table:', e.message));
+
+db.query(`
   CREATE TABLE IF NOT EXISTS diwy_parent_asks (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     parent_id   UUID REFERENCES users(id) ON DELETE CASCADE,
@@ -696,6 +724,215 @@ router.post('/parent/request/:studentId', auth, roles('parent'), async (req, res
     res.json({ ok: true, data: { message: 'Solicitud enviada. El equipo generará el reporte a la brevedad.' } });
   } catch (e) {
     console.error('[diwy] POST /parent/request/:studentId:', e);
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: e.message } });
+  }
+});
+
+// ── AI helpers ────────────────────────────────────────────────
+async function formatParentMessage(studentName, rawMsg, openai) {
+  try {
+    const c = await openai.chat.completions.create({
+      model: MODEL,
+      messages: [
+        { role: 'system', content: `Sos Diwy. Reformateás mensajes de padres para docentes: claro, profesional, breve (máx 2 oraciones). Comenzá con "La familia de ${studentName} "` },
+        { role: 'user',   content: rawMsg },
+      ],
+      max_tokens: 120, temperature: 0.3,
+    });
+    return c.choices[0]?.message?.content?.trim() || rawMsg;
+  } catch { return rawMsg; }
+}
+
+async function formatTeacherReply(rawReply, openai) {
+  try {
+    const c = await openai.chat.completions.create({
+      model: MODEL,
+      messages: [
+        { role: 'system', content: `Sos Diwy. Organizás respuestas rápidas de docentes en mensajes claros y cálidos para los padres. Máx 3 oraciones. Tono amable y profesional. No agregues información que no esté en el texto.` },
+        { role: 'user',   content: rawReply },
+      ],
+      max_tokens: 150, temperature: 0.3,
+    });
+    return c.choices[0]?.message?.content?.trim() || rawReply;
+  } catch { return rawReply; }
+}
+
+// ── POST /parent/message — parent only ────────────────────────
+// Rate limit: 2 messages per parent per day
+router.post('/parent/message', auth, roles('parent'), async (req, res) => {
+  try {
+    const parentId = req.user.id;
+    const { studentId, message } = req.body;
+    if (!studentId || !message?.trim()) {
+      return res.status(400).json({ ok: false, error: { code: 'MISSING_FIELDS', message: 'studentId y message son requeridos' } });
+    }
+
+    // Verify parent-child link
+    const { rows: linkRows } = await db.query(
+      'SELECT 1 FROM parent_student_links WHERE parent_id = $1 AND student_id = $2',
+      [parentId, studentId]
+    );
+    if (!linkRows.length) return res.status(403).json({ ok: false, error: { code: 'UNAUTHORIZED', message: 'No estás vinculado a este alumno' } });
+
+    // Rate limit: 2/day per parent
+    const { rows: [rateRow] } = await db.query(`
+      SELECT COUNT(*)::int AS cnt FROM diwy_messages
+      WHERE parent_id = $1 AND created_at > NOW() - INTERVAL '1 day'
+    `, [parentId]).catch(() => ({ rows: [{ cnt: 0 }] }));
+
+    if ((rateRow?.cnt || 0) >= 2) {
+      return res.status(429).json({ ok: false, error: { code: 'RATE_LIMITED', message: 'Llegaste al límite de 2 mensajes por día. Intentá mañana.' } });
+    }
+
+    const { rows: [student] } = await db.query('SELECT nombre FROM users WHERE id = $1', [studentId]);
+    if (!student) return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND', message: 'Alumno no encontrado' } });
+
+    // AI format the message
+    let formattedMsg = message.trim();
+    try {
+      const openai = getOpenAI();
+      formattedMsg = await formatParentMessage(student.nombre, message.trim(), openai);
+    } catch { /* NO_API_KEY — use raw */ }
+
+    // Save message
+    const { rows: [msg] } = await db.query(`
+      INSERT INTO diwy_messages (parent_id, student_id, original_msg, formatted_msg)
+      VALUES ($1, $2, $3, $4)
+      RETURNING id, estado, created_at, formatted_msg
+    `, [parentId, studentId, message.trim(), formattedMsg]);
+
+    // Notify all active teachers
+    const { rows: teachers } = await db.query(
+      "SELECT id FROM users WHERE rol = 'teacher' AND activo = TRUE"
+    );
+    if (teachers.length > 0) {
+      const vals = teachers.map((_, i) => `($${i*3+1}, $${i*3+2}, $${i*3+3})`).join(', ');
+      const params = teachers.flatMap(t => [t.id, 'diwy_message', `Nuevo mensaje de padres sobre ${student.nombre}`]);
+      await db.query(`INSERT INTO notifications (user_id, tipo, mensaje) VALUES ${vals}`, params).catch(() => {});
+    }
+
+    res.json({ ok: true, data: msg });
+  } catch (e) {
+    console.error('[diwy] POST /parent/message:', e);
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: e.message } });
+  }
+});
+
+// ── GET /parent/messages — parent only ────────────────────────
+router.get('/parent/messages', auth, roles('parent'), async (req, res) => {
+  try {
+    const { rows } = await db.query(`
+      SELECT m.id, m.student_id, u.nombre AS alumno_nombre,
+        m.original_msg, m.formatted_msg, m.formatted_reply,
+        m.estado, m.created_at, m.replied_at,
+        t.nombre AS docente_nombre
+      FROM diwy_messages m
+      JOIN users u ON u.id = m.student_id
+      LEFT JOIN users t ON t.id = m.teacher_id
+      WHERE m.parent_id = $1
+      ORDER BY m.created_at DESC
+      LIMIT 20
+    `, [req.user.id]);
+    res.json({ ok: true, data: rows });
+  } catch (e) {
+    console.error('[diwy] GET /parent/messages:', e);
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: e.message } });
+  }
+});
+
+// ── GET /teacher/messages — teacher/admin only ────────────────
+router.get('/teacher/messages', auth, roles('admin', 'teacher'), async (req, res) => {
+  try {
+    const { rows } = await db.query(`
+      SELECT m.id, m.student_id, s.nombre AS alumno_nombre,
+        m.formatted_msg, m.original_msg, m.teacher_reply,
+        m.estado, m.created_at, m.replied_at
+      FROM diwy_messages m
+      JOIN users s ON s.id = m.student_id
+      ORDER BY m.estado ASC, m.created_at DESC
+      LIMIT 50
+    `);
+    res.json({ ok: true, data: rows });
+  } catch (e) {
+    console.error('[diwy] GET /teacher/messages:', e);
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: e.message } });
+  }
+});
+
+// ── PATCH /teacher/messages/:id/reply — teacher/admin only ────
+router.patch('/teacher/messages/:id/reply', auth, roles('admin', 'teacher'), async (req, res) => {
+  try {
+    const { reply } = req.body;
+    if (!reply?.trim()) return res.status(400).json({ ok: false, error: { code: 'MISSING_FIELDS', message: 'reply es requerido' } });
+
+    const { rows: [msg] } = await db.query('SELECT * FROM diwy_messages WHERE id = $1', [req.params.id]);
+    if (!msg) return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND', message: 'Mensaje no encontrado' } });
+
+    // AI format the reply
+    let formattedReply = reply.trim();
+    try {
+      const openai = getOpenAI();
+      formattedReply = await formatTeacherReply(reply.trim(), openai);
+    } catch { /* NO_API_KEY — use raw */ }
+
+    const { rows: [updated] } = await db.query(`
+      UPDATE diwy_messages
+      SET teacher_reply = $1, formatted_reply = $2,
+          teacher_id = $3, estado = 'replied', replied_at = NOW()
+      WHERE id = $4
+      RETURNING id, estado, replied_at, formatted_reply
+    `, [reply.trim(), formattedReply, req.user.id, req.params.id]);
+
+    // Notify parent
+    await db.query(
+      `INSERT INTO notifications (user_id, tipo, mensaje) VALUES ($1, 'diwy_reply', $2)`,
+      [msg.parent_id, 'La maestra respondió tu consulta en Diwy']
+    ).catch(() => {});
+
+    res.json({ ok: true, data: updated });
+  } catch (e) {
+    console.error('[diwy] PATCH /teacher/messages/:id/reply:', e);
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: e.message } });
+  }
+});
+
+// ── POST /teacher/preview — teacher/admin only ────────────────
+// Upserts today's class preview (one per day, last write wins)
+router.post('/teacher/preview', auth, roles('admin', 'teacher'), async (req, res) => {
+  try {
+    const { tema, detalle } = req.body;
+    if (!tema?.trim()) return res.status(400).json({ ok: false, error: { code: 'MISSING_FIELDS', message: 'tema es requerido' } });
+
+    const { rows: [preview] } = await db.query(`
+      INSERT INTO diwy_class_preview (teacher_id, fecha, tema, detalle)
+      VALUES ($1, CURRENT_DATE, $2, $3)
+      ON CONFLICT (fecha) DO UPDATE
+        SET tema = EXCLUDED.tema, detalle = EXCLUDED.detalle,
+            teacher_id = EXCLUDED.teacher_id, created_at = NOW()
+      RETURNING *
+    `, [req.user.id, tema.trim(), detalle?.trim() || null]);
+
+    res.json({ ok: true, data: preview });
+  } catch (e) {
+    console.error('[diwy] POST /teacher/preview:', e);
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: e.message } });
+  }
+});
+
+// ── GET /parent/preview — parent only ─────────────────────────
+router.get('/parent/preview', auth, roles('parent'), async (req, res) => {
+  try {
+    // Return today's preview if it exists
+    const { rows: [preview] } = await db.query(`
+      SELECT p.tema, p.detalle, p.fecha, u.nombre AS docente_nombre
+      FROM diwy_class_preview p
+      JOIN users u ON u.id = p.teacher_id
+      WHERE p.fecha = CURRENT_DATE
+      LIMIT 1
+    `);
+    res.json({ ok: true, data: preview || null });
+  } catch (e) {
+    console.error('[diwy] GET /parent/preview:', e);
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: e.message } });
   }
 });
