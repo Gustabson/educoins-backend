@@ -59,6 +59,17 @@ db.query(`
   )
 `).catch(e => console.warn('[diwy] diwy_parent_requests table:', e.message));
 
+db.query(`
+  CREATE TABLE IF NOT EXISTS diwy_parent_asks (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    parent_id   UUID REFERENCES users(id) ON DELETE CASCADE,
+    student_id  UUID REFERENCES users(id) ON DELETE CASCADE,
+    question    TEXT NOT NULL,
+    answer      TEXT,
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+  )
+`).catch(e => console.warn('[diwy] diwy_parent_asks table:', e.message));
+
 // ── Helper: Monday of the current week ───────────────────────
 function getMondayISO() {
   const d = new Date();
@@ -396,6 +407,206 @@ router.patch('/reports/:id/approve', auth, roles('admin', 'teacher'), async (req
   } catch (e) {
     console.error('[diwy] PATCH /reports/:id/approve:', e);
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: e.message } });
+  }
+});
+
+// ── GET /parent/snapshot — parent only ───────────────────────
+router.get('/parent/snapshot', auth, roles('parent'), async (req, res) => {
+  try {
+    const parentId = req.user.id;
+
+    const { rows: links } = await db.query(`
+      SELECT psl.student_id, u.nombre
+      FROM parent_student_links psl
+      JOIN users u ON u.id = psl.student_id
+      WHERE psl.parent_id = $1
+      ORDER BY u.nombre ASC
+    `, [parentId]);
+
+    const children = await Promise.all(links.map(async child => {
+      const sid = child.student_id;
+
+      // Balance from ledger
+      const balance = await db.query(`
+        SELECT COALESCE(
+          (SELECT COALESCE(SUM(amount),0) FROM transactions WHERE to_user_id = $1) -
+          (SELECT COALESCE(SUM(amount),0) FROM transactions WHERE from_user_id = $1),
+          0
+        )::int AS balance
+      `, [sid]).then(r => r.rows[0]?.balance ?? 0).catch(() => 0);
+
+      // Mood avg last 7 days
+      const moodData = await db.query(`
+        SELECT ROUND(AVG(mood::numeric), 1) AS avg, COUNT(*)::int AS count
+        FROM mood_entries
+        WHERE user_id = $1 AND created_at > NOW() - INTERVAL '7 days'
+      `, [sid]).then(r => r.rows[0]).catch(() => null);
+
+      // Check-in streak (distinct days in last 14 days)
+      const streak = await db.query(`
+        SELECT COUNT(DISTINCT fecha)::int AS cnt
+        FROM daily_checkins
+        WHERE user_id = $1 AND fecha > CURRENT_DATE - INTERVAL '14 days'
+      `, [sid]).then(r => r.rows[0]?.cnt || 0).catch(() => 0);
+
+      // Recent verdicts
+      const verdicts = await db.query(`
+        SELECT severity, coins_penalty, created_at
+        FROM verdicts
+        WHERE to_user_id = $1
+        ORDER BY created_at DESC
+        LIMIT 4
+      `, [sid]).then(r => r.rows).catch(() => []);
+
+      // Recent transactions (excluding taxes)
+      const txns = await db.query(`
+        SELECT tipo, amount, descripcion, created_at,
+          CASE WHEN to_user_id = $1 THEN 'ingreso' ELSE 'egreso' END AS direccion
+        FROM transactions
+        WHERE (to_user_id = $1 OR from_user_id = $1)
+          AND tipo NOT IN ('tax', 'fee')
+        ORDER BY created_at DESC
+        LIMIT 5
+      `, [sid]).then(r => r.rows).catch(() => []);
+
+      return {
+        id: sid,
+        nombre: child.nombre,
+        balance,
+        mood_avg:       moodData?.count > 0 ? parseFloat(moodData.avg) : null,
+        mood_count:     moodData?.count || 0,
+        checkin_streak: streak,
+        recent_verdicts: verdicts,
+        recent_txns:     txns,
+      };
+    }));
+
+    res.json({ ok: true, data: children });
+  } catch (e) {
+    console.error('[diwy] GET /parent/snapshot:', e);
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: e.message } });
+  }
+});
+
+// ── POST /parent/ask — parent only ────────────────────────────
+router.post('/parent/ask', auth, roles('parent'), async (req, res) => {
+  try {
+    const parentId = req.user.id;
+    const { studentId, question } = req.body;
+
+    if (!studentId || !question?.trim()) {
+      return res.status(400).json({ ok: false, error: { code: 'MISSING_FIELDS', message: 'studentId y question son requeridos' } });
+    }
+
+    // Verify parent-child link
+    const { rows: linkRows } = await db.query(
+      'SELECT 1 FROM parent_student_links WHERE parent_id = $1 AND student_id = $2',
+      [parentId, studentId]
+    );
+    if (!linkRows.length) {
+      return res.status(403).json({ ok: false, error: { code: 'UNAUTHORIZED', message: 'No estás vinculado a este alumno' } });
+    }
+
+    // Rate limit: 5 questions per parent per day
+    const { rows: [rateRow] } = await db.query(`
+      SELECT COUNT(*)::int AS cnt FROM diwy_parent_asks
+      WHERE parent_id = $1 AND created_at > NOW() - INTERVAL '1 day'
+    `, [parentId]).catch(() => ({ rows: [{ cnt: 0 }] }));
+
+    if ((rateRow?.cnt || 0) >= 5) {
+      return res.status(429).json({
+        ok: false,
+        error: { code: 'RATE_LIMITED', message: 'Llegaste al límite de 5 consultas por día. Volvé mañana.' },
+      });
+    }
+
+    const openai = getOpenAI();
+
+    const { rows: [student] } = await db.query(
+      'SELECT nombre FROM users WHERE id = $1 AND rol = $2',
+      [studentId, 'student']
+    );
+    if (!student) return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND', message: 'Alumno no encontrado' } });
+
+    // Build context
+    const txData = await db.query(`
+      SELECT
+        COALESCE(SUM(CASE WHEN to_user_id = $1 AND amount > 0 THEN amount ELSE 0 END), 0)::int AS ganadas,
+        COALESCE(SUM(CASE WHEN from_user_id = $1 AND amount > 0 THEN amount ELSE 0 END), 0)::int AS perdidas
+      FROM transactions
+      WHERE (to_user_id = $1 OR from_user_id = $1)
+        AND created_at > NOW() - INTERVAL '14 days'
+    `, [studentId]).then(r => r.rows[0]).catch(() => ({ ganadas: 0, perdidas: 0 }));
+
+    const moodData = await db.query(`
+      SELECT ROUND(AVG(mood::numeric), 1) AS avg, COUNT(*)::int AS count
+      FROM mood_entries
+      WHERE user_id = $1 AND created_at > NOW() - INTERVAL '14 days'
+    `, [studentId]).then(r => r.rows[0]).catch(() => null);
+
+    const verdicts = await db.query(`
+      SELECT severity, coins_penalty, created_at FROM verdicts
+      WHERE to_user_id = $1 ORDER BY created_at DESC LIMIT 5
+    `, [studentId]).then(r => r.rows).catch(() => []);
+
+    const obsRows = await db.query(`
+      SELECT o.texto, o.semana, u.nombre AS docente_nombre
+      FROM diwy_observations o JOIN users u ON u.id = o.teacher_id
+      WHERE o.student_id = $1 ORDER BY o.semana DESC LIMIT 3
+    `, [studentId]).then(r => r.rows).catch(() => []);
+
+    const lastReport = await db.query(`
+      SELECT reporte_final, periodo_label FROM diwy_reports
+      WHERE student_id = $1 AND estado = 'aprobado'
+      ORDER BY approved_at DESC LIMIT 1
+    `, [studentId]).then(r => r.rows[0] || null).catch(() => null);
+
+    const context = [
+      `Alumno: ${student.nombre}`,
+      `Últimos 14 días: ganó ${txData.ganadas} monedas, perdió ${txData.perdidas} monedas`,
+      moodData?.count > 0
+        ? `Estado emocional: promedio ${moodData.avg}/5 en ${moodData.count} registros`
+        : 'Estado emocional: sin registros recientes',
+      verdicts.length > 0
+        ? `Veredictos: ${verdicts.map(v => `${v.severity} (${new Date(v.created_at).toLocaleDateString('es-AR')})`).join(', ')}`
+        : 'Sin veredictos de conducta recientes',
+      obsRows.length > 0
+        ? `Observaciones docentes:\n${obsRows.map(o => `- ${o.docente_nombre}: "${o.texto}"`).join('\n')}`
+        : 'Sin observaciones docentes recientes',
+      lastReport
+        ? `Último reporte (${lastReport.periodo_label}): "${lastReport.reporte_final?.slice(0, 350)}..."`
+        : 'Sin reportes aprobados aún',
+    ].join('\n');
+
+    const completion = await openai.chat.completions.create({
+      model: MODEL,
+      messages: [
+        {
+          role: 'system',
+          content: `Sos Diwy, el asistente IA de seguimiento educativo de la institución. Respondés consultas de padres sobre sus hijos. Basate EXCLUSIVAMENTE en los datos disponibles. Si no tenés información suficiente para responder algo, decilo con honestidad. Tono: cálido, directo, sin tecnicismos. Máximo 120 palabras.`,
+        },
+        {
+          role: 'user',
+          content: `Contexto del alumno:\n${context}\n\nPregunta: "${question.trim()}"`,
+        },
+      ],
+      max_tokens: 300,
+      temperature: 0.65,
+    });
+
+    const answer = completion.choices[0]?.message?.content?.trim() || '';
+
+    // Save for rate limiting (non-critical)
+    await db.query(
+      'INSERT INTO diwy_parent_asks (parent_id, student_id, question, answer) VALUES ($1, $2, $3, $4)',
+      [parentId, studentId, question.trim(), answer]
+    ).catch(() => {});
+
+    res.json({ ok: true, data: { answer } });
+  } catch (e) {
+    console.error('[diwy] POST /parent/ask:', e);
+    const code = e.code === 'NO_API_KEY' ? 'NO_API_KEY' : 'SERVER_ERROR';
+    res.status(500).json({ ok: false, error: { code, message: e.message } });
   }
 });
 
