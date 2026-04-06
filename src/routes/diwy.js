@@ -217,6 +217,18 @@ router.post('/generate/:studentId', auth, roles('admin', 'teacher'), async (req,
       WHERE user_id = $1 AND fecha > NOW() - INTERVAL '30 days'
     `, [studentId]).then(r => parseInt(r.rows[0].cnt, 10)).catch(() => 0);
 
+    // 3b. Mood/wellness last 30 days
+    const moodData = await db.query(`
+      SELECT
+        ROUND(AVG(mood::numeric), 1)                          AS mood_promedio,
+        COUNT(*)::int                                         AS mood_registros,
+        (SELECT cat FROM mood_entries, UNNEST(categories) AS cat
+          WHERE user_id = $1 AND created_at > NOW() - INTERVAL '30 days'
+          GROUP BY cat ORDER BY COUNT(*) DESC LIMIT 1)       AS categoria_frecuente
+      FROM mood_entries
+      WHERE user_id = $1 AND created_at > NOW() - INTERVAL '30 days'
+    `, [studentId]).then(r => r.rows[0]).catch(() => null);
+
     // 4. Verdicts last 30 days
     const { rows: verdicts } = await db.query(`
       SELECT severity, coins_penalty
@@ -250,6 +262,11 @@ router.post('/generate/:studentId', auth, roles('admin', 'teacher'), async (req,
       coins_perdidas: parseInt(txData.coins_perdidas, 10),
       tx_count: parseInt(txData.tx_count, 10),
       checkins: checkinCount,
+      wellness: moodData?.mood_registros > 0 ? {
+        promedio: parseFloat(moodData.mood_promedio),
+        registros: moodData.mood_registros,
+        categoria_frecuente: moodData.categoria_frecuente || null,
+      } : null,
       verdicts: verdicts,
       misiones_completadas: missionsCount,
       observaciones: obsRows,
@@ -271,6 +288,9 @@ ACTIVIDAD ÚLTIMOS 30 DÍAS:
 - Transacciones totales: ${snapshot.tx_count}
 - Check-ins realizados: ${checkinCount}
 - Misiones completadas: ${missionsCount}
+${snapshot.wellness
+  ? `- Estado emocional (escala 1-5): promedio ${snapshot.wellness.promedio} en ${snapshot.wellness.registros} registros${snapshot.wellness.categoria_frecuente ? ` · emoción más frecuente: ${snapshot.wellness.categoria_frecuente}` : ''}`
+  : '- Estado emocional: sin registros en el período'}`
 
 ${verdicts.length > 0 ? `VEREDICTOS DE CONDUCTA (${verdicts.length}):
 ${verdicts.map(v => `- Severidad: ${v.severity} | Penalidad: ${v.coins_penalty} monedas`).join('\n')}` : 'VEREDICTOS DE CONDUCTA: Ninguno en el período.'}
