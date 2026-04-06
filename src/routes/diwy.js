@@ -288,9 +288,7 @@ ACTIVIDAD ÚLTIMOS 30 DÍAS:
 - Transacciones totales: ${snapshot.tx_count}
 - Check-ins realizados: ${checkinCount}
 - Misiones completadas: ${missionsCount}
-${snapshot.wellness
-  ? `- Estado emocional (escala 1-5): promedio ${snapshot.wellness.promedio} en ${snapshot.wellness.registros} registros${snapshot.wellness.categoria_frecuente ? ` · emoción más frecuente: ${snapshot.wellness.categoria_frecuente}` : ''}`
-  : '- Estado emocional: sin registros en el período'}`
+- Estado emocional: ${snapshot.wellness ? `promedio ${snapshot.wellness.promedio}/5 en ${snapshot.wellness.registros} registros${snapshot.wellness.categoria_frecuente ? ` (emoción frecuente: ${snapshot.wellness.categoria_frecuente})` : ''}` : 'sin registros en el período'}
 
 ${verdicts.length > 0 ? `VEREDICTOS DE CONDUCTA (${verdicts.length}):
 ${verdicts.map(v => `- Severidad: ${v.severity} | Penalidad: ${v.coins_penalty} monedas`).join('\n')}` : 'VEREDICTOS DE CONDUCTA: Ninguno en el período.'}
