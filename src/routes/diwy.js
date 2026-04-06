@@ -2,12 +2,13 @@
 // Diwy — Asistente Preceptor IA
 // Genera reportes de seguimiento para padres usando OpenAI.
 
-const express = require('express');
-const OpenAI  = require('openai');
-const db      = require('../config/db');
-const auth    = require('../middleware/auth');
-const roles   = require('../middleware/roles');
-const router  = express.Router();
+const express   = require('express');
+const OpenAI    = require('openai');
+const db        = require('../config/db');
+const auth      = require('../middleware/auth');
+const roles     = require('../middleware/roles');
+const { getIO } = require('../socket');
+const router    = express.Router();
 
 // ── Lazy OpenAI init ─────────────────────────────────────────
 let _openai = null;
@@ -752,10 +753,13 @@ async function formatTeacherReply(rawReply, openai) {
     const c = await openai.chat.completions.create({
       model: MODEL,
       messages: [
-        { role: 'system', content: `Sos Diwy. Organizás respuestas rápidas de docentes en mensajes claros y cálidos para los padres. Máx 3 oraciones. Tono amable y profesional. No agregues información que no esté en el texto.` },
-        { role: 'user',   content: rawReply },
+        {
+          role: 'system',
+          content: `Sos Diwy, un intermediario de comunicación escolar. Tu única tarea es reformular la respuesta breve de un/a docente en un mensaje claro y amable dirigido a los PADRES del alumno/a. NO respondas a la/el docente. NO agregues información que no esté en el texto original. Simplemente reformulá lo que dijo la maestra/el maestro para que llegue claramente a la familia. Empezá con "La/El docente informa que " o "Según la/el docente, ". Máx 2 oraciones.`,
+        },
+        { role: 'user', content: `Respuesta de la/el docente: "${rawReply}"` },
       ],
-      max_tokens: 150, temperature: 0.3,
+      max_tokens: 150, temperature: 0.2,
     });
     return c.choices[0]?.message?.content?.trim() || rawReply;
   } catch { return rawReply; }
@@ -805,7 +809,7 @@ router.post('/parent/message', auth, roles('parent'), async (req, res) => {
       RETURNING id, estado, created_at, formatted_msg
     `, [parentId, studentId, message.trim(), formattedMsg]);
 
-    // Notify all active teachers
+    // Notify all active teachers via DB + socket (instant)
     const { rows: teachers } = await db.query(
       "SELECT id FROM users WHERE rol = 'teacher' AND activo = TRUE"
     );
@@ -813,6 +817,14 @@ router.post('/parent/message', auth, roles('parent'), async (req, res) => {
       const vals = teachers.map((_, i) => `($${i*3+1}, $${i*3+2}, $${i*3+3})`).join(', ');
       const params = teachers.flatMap(t => [t.id, 'diwy_message', `Nuevo mensaje de padres sobre ${student.nombre}`]);
       await db.query(`INSERT INTO notifications (user_id, tipo, mensaje) VALUES ${vals}`, params).catch(() => {});
+
+      const io = getIO();
+      if (io) teachers.forEach(t =>
+        io.to(`user:${t.id}`).emit('diwy_message', {
+          alumno_nombre: student.nombre,
+          formatted_msg: formattedMsg,
+        })
+      );
     }
 
     res.json({ ok: true, data: msg });
@@ -887,11 +899,18 @@ router.patch('/teacher/messages/:id/reply', auth, roles('admin', 'teacher'), asy
       RETURNING id, estado, replied_at, formatted_reply
     `, [reply.trim(), formattedReply, req.user.id, req.params.id]);
 
-    // Notify parent
+    // Notify parent via DB notification + socket (instant)
     await db.query(
       `INSERT INTO notifications (user_id, tipo, mensaje) VALUES ($1, 'diwy_reply', $2)`,
       [msg.parent_id, 'La maestra respondió tu consulta en Diwy']
     ).catch(() => {});
+
+    const io = getIO();
+    if (io) io.to(`user:${msg.parent_id}`).emit('diwy_reply', {
+      message_id:      updated.id,
+      formatted_reply: formattedReply,
+      replied_at:      updated.replied_at,
+    });
 
     res.json({ ok: true, data: updated });
   } catch (e) {
@@ -918,6 +937,16 @@ router.post('/teacher/preview', auth, roles('admin', 'teacher'), async (req, res
       RETURNING *
     `, [req.user.id, tema.trim(), detalle?.trim() || null, imagen || null]);
 
+    // Notify all connected parents instantly
+    const io = getIO();
+    if (io) io.emit('diwy_preview', {
+      tema:           preview.tema,
+      detalle:        preview.detalle,
+      imagen:         preview.imagen,
+      docente_nombre: req.user.nombre,
+      fecha:          preview.fecha,
+    });
+
     res.json({ ok: true, data: preview });
   } catch (e) {
     console.error('[diwy] POST /teacher/preview:', e);
@@ -930,7 +959,7 @@ router.get('/parent/preview', auth, roles('parent'), async (req, res) => {
   try {
     // Return today's preview if it exists
     const { rows: [preview] } = await db.query(`
-      SELECT p.tema, p.detalle, p.fecha, u.nombre AS docente_nombre
+      SELECT p.tema, p.detalle, p.imagen, p.fecha, u.nombre AS docente_nombre
       FROM diwy_class_preview p
       JOIN users u ON u.id = p.teacher_id
       WHERE p.fecha = CURRENT_DATE
