@@ -82,10 +82,14 @@ db.query(`
     fecha      DATE NOT NULL DEFAULT CURRENT_DATE,
     tema       TEXT NOT NULL,
     detalle    TEXT,
+    imagen     TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE (fecha)
   )
 `).catch(e => console.warn('[diwy] diwy_class_preview table:', e.message));
+
+db.query(`ALTER TABLE diwy_class_preview ADD COLUMN IF NOT EXISTS imagen TEXT`)
+  .catch(() => {});
 
 db.query(`
   CREATE TABLE IF NOT EXISTS diwy_parent_asks (
@@ -903,14 +907,16 @@ router.post('/teacher/preview', auth, roles('admin', 'teacher'), async (req, res
     const { tema, detalle } = req.body;
     if (!tema?.trim()) return res.status(400).json({ ok: false, error: { code: 'MISSING_FIELDS', message: 'tema es requerido' } });
 
+    const { imagen } = req.body;
     const { rows: [preview] } = await db.query(`
-      INSERT INTO diwy_class_preview (teacher_id, fecha, tema, detalle)
-      VALUES ($1, CURRENT_DATE, $2, $3)
+      INSERT INTO diwy_class_preview (teacher_id, fecha, tema, detalle, imagen)
+      VALUES ($1, CURRENT_DATE, $2, $3, $4)
       ON CONFLICT (fecha) DO UPDATE
         SET tema = EXCLUDED.tema, detalle = EXCLUDED.detalle,
+            imagen = EXCLUDED.imagen,
             teacher_id = EXCLUDED.teacher_id, created_at = NOW()
       RETURNING *
-    `, [req.user.id, tema.trim(), detalle?.trim() || null]);
+    `, [req.user.id, tema.trim(), detalle?.trim() || null, imagen || null]);
 
     res.json({ ok: true, data: preview });
   } catch (e) {
