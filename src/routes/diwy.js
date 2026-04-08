@@ -106,6 +106,20 @@ db.query(`
 `).catch(e => console.warn('[diwy] attendance table:', e.message));
 
 db.query(`
+  CREATE TABLE IF NOT EXISTS attendance_edit_requests (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    teacher_id   UUID REFERENCES users(id) ON DELETE CASCADE,
+    classroom_id UUID REFERENCES classrooms(id) ON DELETE CASCADE,
+    fecha        DATE NOT NULL,
+    motivo       TEXT,
+    status       TEXT CHECK (status IN ('pending','approved','denied','consumed')) DEFAULT 'pending',
+    reviewed_by  UUID REFERENCES users(id) ON DELETE SET NULL,
+    reviewed_at  TIMESTAMPTZ,
+    created_at   TIMESTAMPTZ DEFAULT NOW()
+  )
+`).catch(e => console.warn('[diwy] attendance_edit_requests table:', e.message));
+
+db.query(`
   CREATE TABLE IF NOT EXISTS diwy_parent_asks (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     parent_id   UUID REFERENCES users(id) ON DELETE CASCADE,
@@ -990,34 +1004,244 @@ router.get('/teacher/attendance', auth, roles('admin', 'teacher'), async (req, r
       ORDER BY u.nombre ASC
     `, [classroom_id, dateStr]);
 
-    res.json({ ok: true, data: rows });
+    // Return first_saved so frontend can show lock status
+    const { rows:[lockMeta] } = await db.query(`
+      SELECT MIN(created_at) AS first_saved FROM attendance
+      WHERE classroom_id=$1 AND fecha=$2
+    `, [classroom_id, dateStr]);
+
+    res.json({ ok: true, data: rows, first_saved: lockMeta?.first_saved || null });
   } catch (e) {
     console.error('[diwy] GET /teacher/attendance:', e);
     res.status(500).json({ ok:false, error:{ code:'SERVER_ERROR', message:e.message } });
   }
 });
 
-// ── POST /teacher/attendance — upsert attendance records ──────────────────
+// ── POST /teacher/attendance — upsert with 4-hour lock ───────────────────
 router.post('/teacher/attendance', auth, roles('admin', 'teacher'), async (req, res) => {
   try {
     const { classroom_id, fecha, records } = req.body;
     if (!classroom_id || !fecha || !Array.isArray(records) || records.length === 0)
       return res.status(400).json({ ok:false, error:{ code:'MISSING_FIELDS' } });
 
+    // 4-hour lock check
+    const { rows:[lockRow] } = await db.query(`
+      SELECT MIN(created_at) AS first_saved FROM attendance
+      WHERE classroom_id=$1 AND fecha=$2
+    `, [classroom_id, fecha]);
+
+    const locked = lockRow?.first_saved &&
+      (Date.now() - new Date(lockRow.first_saved).getTime()) > 4 * 3600 * 1000;
+
+    if (locked) {
+      // Check for an approved (unconsumed) edit request
+      const { rows:[approved] } = await db.query(`
+        SELECT id FROM attendance_edit_requests
+        WHERE teacher_id=$1 AND classroom_id=$2 AND fecha=$3 AND status='approved'
+        LIMIT 1
+      `, [req.user.id, classroom_id, fecha]);
+
+      if (!approved) {
+        return res.status(403).json({ ok:false, error:{
+          code:'ATTENDANCE_LOCKED',
+          message:'Han pasado más de 4 horas. Solicitá autorización al administrador para editar.',
+        }});
+      }
+      // Consume the authorization
+      await db.query(`UPDATE attendance_edit_requests SET status='consumed' WHERE id=$1`, [approved.id]);
+    }
+
     const valid = ['presente','ausente','tarde'];
     for (const r of records) {
       if (!r.student_id || !valid.includes(r.estado)) continue;
       await db.query(`
         INSERT INTO attendance (student_id, classroom_id, teacher_id, fecha, estado)
-        VALUES ($1, $2, $3, $4, $5)
+        VALUES ($1,$2,$3,$4,$5)
         ON CONFLICT (student_id, fecha)
-        DO UPDATE SET estado=$5, teacher_id=$3, classroom_id=$2, created_at=NOW()
+        DO UPDATE SET estado=$5, teacher_id=$3, classroom_id=$2
       `, [r.student_id, classroom_id, req.user.id, fecha, r.estado]);
     }
 
     res.json({ ok: true });
   } catch (e) {
     console.error('[diwy] POST /teacher/attendance:', e);
+    res.status(500).json({ ok:false, error:{ code:'SERVER_ERROR', message:e.message } });
+  }
+});
+
+// ── GET /teacher/attendance/history — past records summary ────────────────
+router.get('/teacher/attendance/history', auth, roles('admin', 'teacher'), async (req, res) => {
+  try {
+    const { rows } = await db.query(`
+      SELECT
+        a.classroom_id, c.nombre AS classroom_nombre,
+        a.fecha::text,
+        COUNT(*)::int                                         AS total,
+        COUNT(*) FILTER (WHERE a.estado='presente')::int     AS presentes,
+        COUNT(*) FILTER (WHERE a.estado='ausente')::int      AS ausentes,
+        COUNT(*) FILTER (WHERE a.estado='tarde')::int        AS tardes,
+        MIN(a.created_at)                                    AS first_saved
+      FROM attendance a
+      JOIN classrooms c ON c.id = a.classroom_id
+      WHERE a.teacher_id = $1
+      GROUP BY a.classroom_id, c.nombre, a.fecha
+      ORDER BY a.fecha DESC, c.nombre
+      LIMIT 60
+    `, [req.user.id]);
+    res.json({ ok:true, data:rows });
+  } catch(e) {
+    res.status(500).json({ ok:false, error:{ code:'SERVER_ERROR', message:e.message } });
+  }
+});
+
+// ── POST /teacher/attendance/request-edit — request unlock ────────────────
+router.post('/teacher/attendance/request-edit', auth, roles('admin', 'teacher'), async (req, res) => {
+  try {
+    const { classroom_id, fecha, motivo } = req.body;
+    if (!classroom_id || !fecha)
+      return res.status(400).json({ ok:false, error:{ code:'MISSING_FIELDS' } });
+
+    // Avoid duplicate pending requests
+    const { rows:[existing] } = await db.query(`
+      SELECT id FROM attendance_edit_requests
+      WHERE teacher_id=$1 AND classroom_id=$2 AND fecha=$3 AND status='pending'
+    `, [req.user.id, classroom_id, fecha]);
+    if (existing) return res.json({ ok:true, data:{ id:existing.id, status:'pending' } });
+
+    const { rows:[req_] } = await db.query(`
+      INSERT INTO attendance_edit_requests (teacher_id, classroom_id, fecha, motivo)
+      VALUES ($1,$2,$3,$4) RETURNING id, status, created_at
+    `, [req.user.id, classroom_id, fecha, motivo||null]);
+
+    // Notify admins via socket
+    try {
+      const { getIO } = require('../socket');
+      const io = getIO();
+      if (io) io.emit('attendance_edit_request', { classroom_id, fecha });
+    } catch {}
+
+    res.json({ ok:true, data:req_ });
+  } catch(e) {
+    res.status(500).json({ ok:false, error:{ code:'SERVER_ERROR', message:e.message } });
+  }
+});
+
+// ── GET /admin/attendance — admin read-only view ──────────────────────────
+router.get('/admin/attendance', auth, roles('admin'), async (req, res) => {
+  try {
+    const { fecha, search } = req.query;
+    const dateStr = fecha || new Date().toISOString().split('T')[0];
+
+    if (search?.trim()) {
+      // Cross-classroom search by name or id fragment
+      const { rows } = await db.query(`
+        SELECT DISTINCT ON (u.id)
+          u.id, u.nombre, a.estado, a.fecha::text,
+          c.id AS classroom_id, c.nombre AS classroom_nombre,
+          t.nombre AS teacher_nombre
+        FROM users u
+        JOIN classroom_members cm ON cm.user_id = u.id
+        JOIN classrooms c ON c.id = cm.classroom_id AND c.activa = TRUE
+        LEFT JOIN attendance a ON a.student_id = u.id AND a.fecha = $2
+        LEFT JOIN users t ON t.id = a.teacher_id
+        WHERE u.rol = 'student' AND u.activo = TRUE
+          AND (u.nombre ILIKE '%' || $1 || '%' OR u.id::text ILIKE $1 || '%')
+        ORDER BY u.id, u.nombre
+        LIMIT 60
+      `, [search.trim(), dateStr]);
+      return res.json({ ok:true, data: rows });
+    }
+
+    // Overview: all classrooms with attendance summary for the date
+    const { rows } = await db.query(`
+      SELECT
+        c.id, c.nombre,
+        COUNT(DISTINCT cm.user_id)::int                          AS total_students,
+        COUNT(DISTINCT a.student_id)::int                        AS marked,
+        COUNT(*) FILTER (WHERE a.estado='presente')::int         AS presentes,
+        COUNT(*) FILTER (WHERE a.estado='ausente')::int          AS ausentes,
+        COUNT(*) FILTER (WHERE a.estado='tarde')::int            AS tardes,
+        MIN(a.created_at)                                        AS taken_at,
+        MAX(t.nombre)                                            AS teacher_nombre
+      FROM classrooms c
+      JOIN classroom_members cm ON cm.classroom_id = c.id AND cm.rol = 'student'
+      LEFT JOIN attendance a   ON a.student_id = cm.user_id AND a.fecha = $1
+      LEFT JOIN users t        ON t.id = a.teacher_id
+      WHERE c.activa = TRUE
+      GROUP BY c.id, c.nombre
+      ORDER BY c.nombre
+    `, [dateStr]);
+    res.json({ ok:true, data: rows });
+  } catch(e) {
+    console.error('[diwy] GET /admin/attendance:', e);
+    res.status(500).json({ ok:false, error:{ code:'SERVER_ERROR', message:e.message } });
+  }
+});
+
+// ── GET /admin/attendance/:classroomId/detail — students for a date ────────
+router.get('/admin/attendance/:classroomId/detail', auth, roles('admin'), async (req, res) => {
+  try {
+    const { fecha } = req.query;
+    const dateStr = fecha || new Date().toISOString().split('T')[0];
+    const { rows } = await db.query(`
+      SELECT u.id, u.nombre, a.estado, a.created_at, t.nombre AS teacher_nombre
+      FROM classroom_members cm
+      JOIN users u ON u.id = cm.user_id AND u.rol = 'student' AND u.activo = TRUE
+      LEFT JOIN attendance a ON a.student_id = u.id AND a.fecha = $2
+      LEFT JOIN users t ON t.id = a.teacher_id
+      WHERE cm.classroom_id = $1
+      ORDER BY u.nombre
+    `, [req.params.classroomId, dateStr]);
+    res.json({ ok:true, data: rows });
+  } catch(e) {
+    res.status(500).json({ ok:false, error:{ code:'SERVER_ERROR', message:e.message } });
+  }
+});
+
+// ── GET /admin/attendance/edit-requests — pending edit requests ────────────
+router.get('/admin/attendance/edit-requests', auth, roles('admin'), async (req, res) => {
+  try {
+    const { rows } = await db.query(`
+      SELECT r.*, t.nombre AS teacher_nombre, c.nombre AS classroom_nombre
+      FROM attendance_edit_requests r
+      JOIN users t       ON t.id = r.teacher_id
+      JOIN classrooms c  ON c.id = r.classroom_id
+      WHERE r.status = 'pending'
+      ORDER BY r.created_at ASC
+    `);
+    res.json({ ok:true, data:rows });
+  } catch(e) {
+    res.status(500).json({ ok:false, error:{ code:'SERVER_ERROR', message:e.message } });
+  }
+});
+
+// ── PATCH /admin/attendance/edit-requests/:id — approve or deny ────────────
+router.patch('/admin/attendance/edit-requests/:id', auth, roles('admin'), async (req, res) => {
+  try {
+    const { action } = req.body; // 'approved' | 'denied'
+    if (!['approved','denied'].includes(action))
+      return res.status(400).json({ ok:false, error:{ code:'INVALID_ACTION' } });
+
+    const { rows:[updated] } = await db.query(`
+      UPDATE attendance_edit_requests
+      SET status=$1, reviewed_by=$2, reviewed_at=NOW()
+      WHERE id=$3 AND status='pending'
+      RETURNING *
+    `, [action, req.user.id, req.params.id]);
+
+    if (!updated) return res.status(404).json({ ok:false, error:{ code:'NOT_FOUND' } });
+
+    // Notify teacher
+    try {
+      const { getIO } = require('../socket');
+      const io = getIO();
+      if (io) io.to(`user:${updated.teacher_id}`).emit('attendance_request_reviewed', {
+        status: action, classroom_id: updated.classroom_id, fecha: updated.fecha,
+      });
+    } catch {}
+
+    res.json({ ok:true, data:updated });
+  } catch(e) {
     res.status(500).json({ ok:false, error:{ code:'SERVER_ERROR', message:e.message } });
   }
 });
