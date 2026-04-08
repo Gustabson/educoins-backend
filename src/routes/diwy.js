@@ -117,7 +117,7 @@ router.get('/students', auth, roles('admin', 'teacher'), async (req, res) => {
   try {
     const { rows } = await db.query(`
       SELECT
-        u.id, u.nombre, u.balance,
+        u.id, u.nombre,
         lr.id            AS last_report_id,
         lr.estado        AS last_report_estado,
         lr.created_at    AS last_report_at,
