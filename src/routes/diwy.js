@@ -116,13 +116,17 @@ function getMondayISO() {
 router.get('/students', auth, roles('admin', 'teacher'), async (req, res) => {
   try {
     const { rows } = await db.query(`
-      SELECT
+      SELECT DISTINCT ON (u.id)
         u.id, u.nombre,
+        c.id     AS classroom_id,
+        c.nombre AS classroom_nombre,
         lr.id            AS last_report_id,
         lr.estado        AS last_report_estado,
         lr.created_at    AS last_report_at,
         lr.periodo_label
       FROM users u
+      LEFT JOIN classroom_members cm ON cm.user_id = u.id AND cm.rol = 'student'
+      LEFT JOIN classrooms c ON c.id = cm.classroom_id AND c.activa = TRUE
       LEFT JOIN LATERAL (
         SELECT id, estado, created_at, periodo_label
         FROM diwy_reports
@@ -131,7 +135,7 @@ router.get('/students', auth, roles('admin', 'teacher'), async (req, res) => {
         LIMIT 1
       ) lr ON TRUE
       WHERE u.rol = 'student' AND u.activo = TRUE
-      ORDER BY u.nombre ASC
+      ORDER BY u.id, c.nombre ASC NULLS LAST, u.nombre ASC
     `);
     res.json({ ok: true, data: rows });
   } catch (e) {
