@@ -93,6 +93,19 @@ db.query(`ALTER TABLE diwy_class_preview ADD COLUMN IF NOT EXISTS imagen TEXT`)
   .catch(() => {});
 
 db.query(`
+  CREATE TABLE IF NOT EXISTS attendance (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    student_id   UUID REFERENCES users(id) ON DELETE CASCADE,
+    classroom_id UUID REFERENCES classrooms(id) ON DELETE SET NULL,
+    teacher_id   UUID REFERENCES users(id) ON DELETE SET NULL,
+    fecha        DATE NOT NULL,
+    estado       TEXT CHECK (estado IN ('presente','ausente','tarde')) NOT NULL,
+    created_at   TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(student_id, fecha)
+  )
+`).catch(e => console.warn('[diwy] attendance table:', e.message));
+
+db.query(`
   CREATE TABLE IF NOT EXISTS diwy_parent_asks (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     parent_id   UUID REFERENCES users(id) ON DELETE CASCADE,
@@ -958,6 +971,74 @@ router.patch('/teacher/messages/:id/reply', auth, roles('admin', 'teacher'), asy
   } catch (e) {
     console.error('[diwy] PATCH /teacher/messages/:id/reply:', e);
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: e.message } });
+  }
+});
+
+// ── GET /teacher/attendance — load students + their status for a date ──────
+router.get('/teacher/attendance', auth, roles('admin', 'teacher'), async (req, res) => {
+  try {
+    const { classroom_id, fecha } = req.query;
+    if (!classroom_id) return res.status(400).json({ ok:false, error:{ code:'MISSING_FIELDS', message:'classroom_id requerido' } });
+    const dateStr = fecha || new Date().toISOString().split('T')[0];
+
+    const { rows } = await db.query(`
+      SELECT u.id, u.nombre, a.estado
+      FROM classroom_members cm
+      JOIN users u ON u.id = cm.user_id AND u.rol = 'student' AND u.activo = TRUE
+      LEFT JOIN attendance a ON a.student_id = u.id AND a.fecha = $2
+      WHERE cm.classroom_id = $1
+      ORDER BY u.nombre ASC
+    `, [classroom_id, dateStr]);
+
+    res.json({ ok: true, data: rows });
+  } catch (e) {
+    console.error('[diwy] GET /teacher/attendance:', e);
+    res.status(500).json({ ok:false, error:{ code:'SERVER_ERROR', message:e.message } });
+  }
+});
+
+// ── POST /teacher/attendance — upsert attendance records ──────────────────
+router.post('/teacher/attendance', auth, roles('admin', 'teacher'), async (req, res) => {
+  try {
+    const { classroom_id, fecha, records } = req.body;
+    if (!classroom_id || !fecha || !Array.isArray(records) || records.length === 0)
+      return res.status(400).json({ ok:false, error:{ code:'MISSING_FIELDS' } });
+
+    const valid = ['presente','ausente','tarde'];
+    for (const r of records) {
+      if (!r.student_id || !valid.includes(r.estado)) continue;
+      await db.query(`
+        INSERT INTO attendance (student_id, classroom_id, teacher_id, fecha, estado)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (student_id, fecha)
+        DO UPDATE SET estado=$5, teacher_id=$3, classroom_id=$2, created_at=NOW()
+      `, [r.student_id, classroom_id, req.user.id, fecha, r.estado]);
+    }
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[diwy] POST /teacher/attendance:', e);
+    res.status(500).json({ ok:false, error:{ code:'SERVER_ERROR', message:e.message } });
+  }
+});
+
+// ── GET /parent/attendance — attendance for linked children ───────────────
+router.get('/parent/attendance', auth, roles('parent'), async (req, res) => {
+  try {
+    const weeks = Math.min(Math.max(parseInt(req.query.weeks) || 1, 1), 8);
+    const { rows } = await db.query(`
+      SELECT a.fecha::text, a.estado, a.student_id, u.nombre AS student_nombre
+      FROM attendance a
+      JOIN users u ON u.id = a.student_id
+      JOIN parent_student_links psl ON psl.student_id = a.student_id
+      WHERE psl.parent_id = $1
+        AND a.fecha >= CURRENT_DATE - ($2 * 7)::int
+      ORDER BY a.fecha DESC, u.nombre ASC
+    `, [req.user.id, weeks]);
+    res.json({ ok: true, data: rows });
+  } catch (e) {
+    console.error('[diwy] GET /parent/attendance:', e);
+    res.status(500).json({ ok:false, error:{ code:'SERVER_ERROR', message:e.message } });
   }
 });
 
