@@ -856,18 +856,56 @@ router.get('/parent/messages', auth, roles('parent'), async (req, res) => {
   }
 });
 
-// ── GET /teacher/messages — teacher/admin only ────────────────
-router.get('/teacher/messages', auth, roles('admin', 'teacher'), async (req, res) => {
+// ── GET /teacher/classrooms — teacher's own classrooms ────────
+router.get('/teacher/classrooms', auth, roles('admin', 'teacher'), async (req, res) => {
   try {
     const { rows } = await db.query(`
-      SELECT m.id, m.student_id, s.nombre AS alumno_nombre,
-        m.formatted_msg, m.original_msg, m.teacher_reply,
-        m.estado, m.created_at, m.replied_at
+      SELECT c.id, c.nombre
+      FROM classrooms c
+      JOIN classroom_members cm ON cm.classroom_id = c.id
+      WHERE cm.user_id = $1 AND c.activa = TRUE
+      ORDER BY c.nombre
+    `, [req.user.id]);
+    res.json({ ok: true, data: rows });
+  } catch (e) {
+    console.error('[diwy] GET /teacher/classrooms:', e);
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: e.message } });
+  }
+});
+
+// ── GET /teacher/messages — teacher/admin only ────────────────
+// Query params: classroom_id, date_from (YYYY-MM-DD), date_to (YYYY-MM-DD)
+router.get('/teacher/messages', auth, roles('admin', 'teacher'), async (req, res) => {
+  try {
+    const classroom_id = req.query.classroom_id || null;
+    const date_from    = req.query.date_from    || null;
+    const date_to      = req.query.date_to      || null;
+
+    const { rows } = await db.query(`
+      SELECT DISTINCT ON (m.id)
+        m.id, m.student_id, s.nombre AS alumno_nombre,
+        m.formatted_msg, m.original_msg, m.teacher_reply, m.formatted_reply,
+        m.estado, m.created_at, m.replied_at,
+        c.id   AS classroom_id,
+        c.nombre AS classroom_nombre
       FROM diwy_messages m
       JOIN users s ON s.id = m.student_id
-      ORDER BY m.estado ASC, m.created_at DESC
-      LIMIT 50
-    `);
+      LEFT JOIN classroom_members cm ON cm.user_id = m.student_id AND cm.rol = 'student'
+      LEFT JOIN classrooms c ON c.id = cm.classroom_id
+      WHERE m.created_at > NOW() - INTERVAL '2 years'
+        AND ($1::uuid IS NULL OR c.id = $1::uuid)
+        AND ($2::date IS NULL OR m.created_at::date >= $2::date)
+        AND ($3::date IS NULL OR m.created_at::date <= $3::date)
+      ORDER BY m.id, m.created_at DESC
+      LIMIT 500
+    `, [classroom_id, date_from, date_to]);
+
+    // Re-sort after DISTINCT ON
+    rows.sort((a, b) => {
+      if (a.estado === b.estado) return new Date(b.created_at) - new Date(a.created_at);
+      return a.estado === 'pending' ? -1 : 1;
+    });
+
     res.json({ ok: true, data: rows });
   } catch (e) {
     console.error('[diwy] GET /teacher/messages:', e);
