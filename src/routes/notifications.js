@@ -10,6 +10,62 @@ const router  = express.Router();
 const db      = require('../config/db');
 const auth    = require('../middleware/auth');
 
+// ── GET /notifications/badge-counts ──────────────────────────
+// Returns unread/pending counts per section for the nav badges.
+// Works for all roles; some counts are role-specific.
+router.get('/badge-counts', auth, async (req, res) => {
+  try {
+    const uid = req.user.id;
+    const rol = req.user.rol;
+
+    // Run all counts in parallel
+    const [diwyRes, verdictRes, sugRes, postRes, exchRes] = await Promise.all([
+      // Diwy: unread diwy_reply notifications
+      db.query(
+        `SELECT COUNT(*)::int AS cnt FROM notifications WHERE user_id=$1 AND tipo='diwy_reply' AND leida=false`,
+        [uid]
+      ),
+      // Veredictos: parents see unread verdicts for their children; others see own
+      rol === 'parent'
+        ? db.query(`
+            SELECT COUNT(*)::int AS cnt FROM verdicts v
+            JOIN parent_student_links psl ON psl.student_id = v.to_user_id
+            WHERE psl.parent_id = $1 AND v.read_at IS NULL
+          `, [uid])
+        : db.query(
+            `SELECT COUNT(*)::int AS cnt FROM verdicts WHERE to_user_id=$1 AND read_at IS NULL`,
+            [uid]
+          ),
+      // Sugerencias: unread notifications of suggestion tipos
+      db.query(
+        `SELECT COUNT(*)::int AS cnt FROM notifications
+         WHERE user_id=$1 AND tipo IN ('sugerencia','mejora_educativa','mejora_convivencia') AND leida=false`,
+        [uid]
+      ),
+      // Noticias: posts published in the last 7 days (no per-user read tracking)
+      db.query(`SELECT COUNT(*)::int AS cnt FROM posts WHERE created_at > NOW() - INTERVAL '7 days'`),
+      // Exchange: orders that need this user's action
+      db.query(
+        `SELECT COUNT(*)::int AS cnt FROM p2p_orders
+         WHERE (buyer_id=$1  AND status='pending_payment')
+            OR (seller_id=$1 AND status='payment_sent')`,
+        [uid]
+      ),
+    ]);
+
+    res.json({ ok: true, data: {
+      diwy:       diwyRes.rows[0].cnt,
+      veredictos: verdictRes.rows[0].cnt,
+      sugerencias:sugRes.rows[0].cnt,
+      noticias:   postRes.rows[0].cnt,
+      exchange:   exchRes.rows[0].cnt,
+    }});
+  } catch (e) {
+    console.error('[badge-counts]', e);
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: e.message } });
+  }
+});
+
 // ── GET /notifications ────────────────────────────────────────
 router.get('/', auth, async (req, res) => {
   try {
