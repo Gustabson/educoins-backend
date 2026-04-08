@@ -67,6 +67,14 @@ app.use('/api/v1/ai',           require('./routes/ai'));
 app.use('/api/v1/ai-docs',      require('./routes/ai-docs'));
 app.use('/api/v1/diwy',         require('./routes/diwy'));
 
+// ── One-time migrations ───────────────────────────────────────
+// Unify legacy 'maestra' role → 'teacher'
+require('./config/db').query(
+  "UPDATE users SET rol = 'teacher' WHERE rol = 'maestra'"
+).then(r => {
+  if (r.rowCount > 0) console.log(`[migration] Migrated ${r.rowCount} user(s) from rol='maestra' to 'teacher'`);
+}).catch(e => console.warn('[migration] maestra→teacher:', e.message));
+
 // ── Health check ──────────────────────────────────────────────
 app.get('/health', (req, res) => {
   res.json({ ok: true, message: 'Aubank API funcionando', timestamp: new Date() });

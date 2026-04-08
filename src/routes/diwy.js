@@ -113,7 +113,7 @@ function getMondayISO() {
 }
 
 // ── GET /students — admin/teacher ────────────────────────────
-router.get('/students', auth, roles('admin', 'teacher', 'maestra'), async (req, res) => {
+router.get('/students', auth, roles('admin', 'teacher'), async (req, res) => {
   try {
     const { rows } = await db.query(`
       SELECT
@@ -176,7 +176,7 @@ router.get('/students', auth, roles('admin', 'teacher', 'maestra'), async (req, 
 });
 
 // ── POST /observations — admin/teacher ───────────────────────
-router.post('/observations', auth, roles('admin', 'teacher', 'maestra'), async (req, res) => {
+router.post('/observations', auth, roles('admin', 'teacher'), async (req, res) => {
   try {
     const { student_id, texto, semana } = req.body;
     if (!student_id || !texto) {
@@ -196,7 +196,7 @@ router.post('/observations', auth, roles('admin', 'teacher', 'maestra'), async (
 });
 
 // ── GET /observations/:studentId — admin/teacher ─────────────
-router.get('/observations/:studentId', auth, roles('admin', 'teacher', 'maestra'), async (req, res) => {
+router.get('/observations/:studentId', auth, roles('admin', 'teacher'), async (req, res) => {
   try {
     const { rows } = await db.query(`
       SELECT o.*, u.nombre AS docente_nombre
@@ -213,7 +213,7 @@ router.get('/observations/:studentId', auth, roles('admin', 'teacher', 'maestra'
 });
 
 // ── DELETE /observations/:id — admin/teacher (own or admin) ──
-router.delete('/observations/:id', auth, roles('admin', 'teacher', 'maestra'), async (req, res) => {
+router.delete('/observations/:id', auth, roles('admin', 'teacher'), async (req, res) => {
   try {
     const { rows } = await db.query('SELECT * FROM diwy_observations WHERE id = $1', [req.params.id]);
     if (!rows.length) return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND', message: 'Observación no encontrada' } });
@@ -230,7 +230,7 @@ router.delete('/observations/:id', auth, roles('admin', 'teacher', 'maestra'), a
 });
 
 // ── POST /generate/:studentId — admin/teacher ────────────────
-router.post('/generate/:studentId', auth, roles('admin', 'teacher', 'maestra'), async (req, res) => {
+router.post('/generate/:studentId', auth, roles('admin', 'teacher'), async (req, res) => {
   try {
     const { studentId } = req.params;
     const openai = getOpenAI();
@@ -386,7 +386,7 @@ REGLAS:
 });
 
 // ── GET /reports/:studentId — admin/teacher ───────────────────
-router.get('/reports/:studentId', auth, roles('admin', 'teacher', 'maestra'), async (req, res) => {
+router.get('/reports/:studentId', auth, roles('admin', 'teacher'), async (req, res) => {
   try {
     const { rows } = await db.query(`
       SELECT r.*, u.nombre AS generado_por_nombre
@@ -403,7 +403,7 @@ router.get('/reports/:studentId', auth, roles('admin', 'teacher', 'maestra'), as
 });
 
 // ── PATCH /reports/:id/review — admin/teacher ────────────────
-router.patch('/reports/:id/review', auth, roles('admin', 'teacher', 'maestra'), async (req, res) => {
+router.patch('/reports/:id/review', auth, roles('admin', 'teacher'), async (req, res) => {
   try {
     const { reporte_final } = req.body;
     if (!reporte_final) {
@@ -424,7 +424,7 @@ router.patch('/reports/:id/review', auth, roles('admin', 'teacher', 'maestra'), 
 });
 
 // ── PATCH /reports/:id/approve — admin/teacher ───────────────
-router.patch('/reports/:id/approve', auth, roles('admin', 'teacher', 'maestra'), async (req, res) => {
+router.patch('/reports/:id/approve', auth, roles('admin', 'teacher'), async (req, res) => {
   try {
     const { rows } = await db.query(`
       UPDATE diwy_reports
@@ -857,7 +857,7 @@ router.get('/parent/messages', auth, roles('parent'), async (req, res) => {
 });
 
 // ── GET /teacher/classrooms — teacher's own classrooms ────────
-router.get('/teacher/classrooms', auth, roles('admin', 'teacher', 'maestra'), async (req, res) => {
+router.get('/teacher/classrooms', auth, roles('admin', 'teacher'), async (req, res) => {
   try {
     const { rows } = await db.query(`
       SELECT c.id, c.nombre
@@ -875,7 +875,7 @@ router.get('/teacher/classrooms', auth, roles('admin', 'teacher', 'maestra'), as
 
 // ── GET /teacher/messages — teacher/admin only ────────────────
 // Query params: classroom_id, date_from (YYYY-MM-DD), date_to (YYYY-MM-DD)
-router.get('/teacher/messages', auth, roles('admin', 'teacher', 'maestra'), async (req, res) => {
+router.get('/teacher/messages', auth, roles('admin', 'teacher'), async (req, res) => {
   try {
     const classroom_id = req.query.classroom_id || null;
     const date_from    = req.query.date_from    || null;
@@ -914,7 +914,7 @@ router.get('/teacher/messages', auth, roles('admin', 'teacher', 'maestra'), asyn
 });
 
 // ── PATCH /teacher/messages/:id/reply — teacher/admin only ────
-router.patch('/teacher/messages/:id/reply', auth, roles('admin', 'teacher', 'maestra'), async (req, res) => {
+router.patch('/teacher/messages/:id/reply', auth, roles('admin', 'teacher'), async (req, res) => {
   try {
     const { reply } = req.body;
     if (!reply?.trim()) return res.status(400).json({ ok: false, error: { code: 'MISSING_FIELDS', message: 'reply es requerido' } });
@@ -959,7 +959,7 @@ router.patch('/teacher/messages/:id/reply', auth, roles('admin', 'teacher', 'mae
 
 // ── POST /teacher/preview — teacher/admin only ────────────────
 // Upserts today's class preview (one per day, last write wins)
-router.post('/teacher/preview', auth, roles('admin', 'teacher', 'maestra'), async (req, res) => {
+router.post('/teacher/preview', auth, roles('admin', 'teacher'), async (req, res) => {
   try {
     const { tema, detalle } = req.body;
     if (!tema?.trim()) return res.status(400).json({ ok: false, error: { code: 'MISSING_FIELDS', message: 'tema es requerido' } });
