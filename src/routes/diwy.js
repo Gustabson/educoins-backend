@@ -671,6 +671,125 @@ router.post('/parent/ask', auth, roles('parent'), async (req, res) => {
   }
 });
 
+// ── POST /parent/instant-report — parent only ────────────────────────────
+// Generates an on-demand AI report for a child. 2/day limit.
+// Uses observations, mood, attendance, verdicts. Never mentions explicit grades.
+router.post('/parent/instant-report', auth, roles('parent'), async (req, res) => {
+  try {
+    const parentId = req.user.id;
+    const { studentId } = req.body;
+
+    if (!studentId) return res.status(400).json({ ok: false, error: { code: 'MISSING_FIELDS', message: 'studentId requerido' } });
+
+    // Verify link
+    const { rows: linkRows } = await db.query(
+      'SELECT 1 FROM parent_student_links WHERE parent_id = $1 AND student_id = $2',
+      [parentId, studentId]
+    );
+    if (!linkRows.length) return res.status(403).json({ ok: false, error: { code: 'UNAUTHORIZED', message: 'No autorizado' } });
+
+    // Rate limit: 2/day (reuses diwy_parent_asks with sentinel question)
+    const { rows: [rateRow] } = await db.query(`
+      SELECT COUNT(*)::int AS cnt FROM diwy_parent_asks
+      WHERE parent_id = $1 AND student_id = $2
+        AND question = '__instant_report__'
+        AND created_at > NOW() - INTERVAL '1 day'
+    `, [parentId, studentId]).catch(() => ({ rows: [{ cnt: 0 }] }));
+
+    if ((rateRow?.cnt || 0) >= 2) {
+      return res.status(429).json({ ok: false, error: { code: 'RATE_LIMITED', message: 'Ya generaste 2 reportes hoy. Volvé mañana.' } });
+    }
+
+    const openai = getOpenAI();
+
+    const { rows: [student] } = await db.query(
+      'SELECT nombre FROM users WHERE id = $1 AND rol = $2', [studentId, 'student']
+    );
+    if (!student) return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND', message: 'Alumno no encontrado' } });
+
+    // Build rich context
+    const [moodData, verdicts, obsRows, attSummary] = await Promise.all([
+      db.query(`
+        SELECT ROUND(AVG(mood::numeric),1) AS avg, COUNT(*)::int AS count
+        FROM mood_entries WHERE user_id = $1 AND created_at > NOW() - INTERVAL '14 days'
+      `, [studentId]).then(r => r.rows[0]).catch(() => null),
+
+      db.query(`
+        SELECT severity, created_at FROM verdicts
+        WHERE to_user_id = $1 ORDER BY created_at DESC LIMIT 5
+      `, [studentId]).then(r => r.rows).catch(() => []),
+
+      db.query(`
+        SELECT o.texto, o.semana, u.nombre AS docente_nombre
+        FROM diwy_observations o JOIN users u ON u.id = o.teacher_id
+        WHERE o.student_id = $1 ORDER BY o.semana DESC LIMIT 5
+      `, [studentId]).then(r => r.rows).catch(() => []),
+
+      db.query(`
+        SELECT estado, COUNT(*)::int AS cnt
+        FROM attendance WHERE student_id = $1 AND fecha >= CURRENT_DATE - 28
+        GROUP BY estado
+      `, [studentId]).then(r => r.rows).catch(() => []),
+    ]);
+
+    const attMap   = Object.fromEntries(attSummary.map(r => [r.estado, r.cnt]));
+    const attTotal = (attMap.presente||0) + (attMap.ausente||0) + (attMap.tarde||0);
+    const attText  = attTotal > 0
+      ? `Asistencia últimas 4 semanas: ${attMap.presente||0} presente, ${attMap.ausente||0} ausente, ${attMap.tarde||0} tarde (${attTotal} días)`
+      : 'Sin registros de asistencia recientes';
+
+    const context = [
+      `Alumno: ${student.nombre}`,
+      moodData?.count > 0
+        ? `Estado emocional: promedio ${moodData.avg}/5 en ${moodData.count} registros (últimas 2 semanas)`
+        : 'Estado emocional: sin registros recientes',
+      attText,
+      verdicts.length > 0
+        ? `Conducta: ${verdicts.map(v => `${v.severity} (${new Date(v.created_at).toLocaleDateString('es-AR')})`).join(', ')}`
+        : 'Conducta: sin incidentes registrados recientemente',
+      obsRows.length > 0
+        ? `Observaciones docentes:\n${obsRows.map(o => `- ${o.docente_nombre} (sem. ${o.semana}): "${o.texto}"`).join('\n')}`
+        : 'Sin observaciones docentes recientes',
+    ].join('\n');
+
+    const completion = await openai.chat.completions.create({
+      model: MODEL,
+      messages: [
+        {
+          role: 'system',
+          content: `Sos Diwy, el asistente IA de seguimiento educativo de la institución. Generás reportes de seguimiento breves para las familias.
+REGLAS ESTRICTAS:
+- Basate EXCLUSIVAMENTE en los datos disponibles. No inventes información.
+- NUNCA menciones calificaciones numéricas ni notas específicas. Solo podés mencionar rendimiento de forma general ("viene avanzando bien", "necesita apoyo en algunos temas").
+- Tono: cálido, empático, positivo cuando corresponda, directo y sin tecnicismos.
+- Estructura en 4 párrafos cortos: 1) Estado general del alumno, 2) Asistencia, 3) Puntos destacados (conducta/observaciones), 4) Sugerencia o mensaje de aliento para la familia.
+- Máximo 180 palabras en total.`,
+        },
+        {
+          role: 'user',
+          content: `Generá un reporte de seguimiento para la familia de:\n\n${context}`,
+        },
+      ],
+      max_tokens: 450,
+      temperature: 0.6,
+    });
+
+    const report = completion.choices[0]?.message?.content?.trim() || '';
+
+    // Save for rate limiting
+    await db.query(
+      'INSERT INTO diwy_parent_asks (parent_id, student_id, question, answer) VALUES ($1, $2, $3, $4)',
+      [parentId, studentId, '__instant_report__', report]
+    ).catch(() => {});
+
+    res.json({ ok: true, data: { report } });
+  } catch (e) {
+    console.error('[diwy] POST /parent/instant-report:', e);
+    const code = e.code === 'NO_API_KEY' ? 'NO_API_KEY' : 'SERVER_ERROR';
+    res.status(500).json({ ok: false, error: { code, message: e.message } });
+  }
+});
+
 // ── GET /parent — parent only ─────────────────────────────────
 router.get('/parent', auth, roles('parent'), async (req, res) => {
   try {
@@ -1246,7 +1365,7 @@ router.patch('/admin/attendance/edit-requests/:id', auth, roles('admin'), async 
 // ── GET /parent/attendance — attendance for linked children ───────────────
 router.get('/parent/attendance', auth, roles('parent'), async (req, res) => {
   try {
-    const weeks = Math.min(Math.max(parseInt(req.query.weeks) || 1, 1), 8);
+    const weeks = Math.min(Math.max(parseInt(req.query.weeks) || 1, 1), 52);
     const { rows } = await db.query(`
       SELECT a.fecha::text, a.estado, a.student_id, u.nombre AS student_nombre
       FROM attendance a
