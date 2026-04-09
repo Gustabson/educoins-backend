@@ -688,13 +688,13 @@ router.post('/parent/instant-report', auth, roles('parent'), async (req, res) =>
     );
     if (!linkRows.length) return res.status(403).json({ ok: false, error: { code: 'UNAUTHORIZED', message: 'No autorizado' } });
 
-    // Rate limit: 2/day (reuses diwy_parent_asks with sentinel question)
+    // Rate limit: 2/day per parent (reuses diwy_parent_asks with sentinel question)
     const { rows: [rateRow] } = await db.query(`
       SELECT COUNT(*)::int AS cnt FROM diwy_parent_asks
-      WHERE parent_id = $1 AND student_id = $2
+      WHERE parent_id = $1
         AND question = '__instant_report__'
         AND created_at > NOW() - INTERVAL '1 day'
-    `, [parentId, studentId]).catch(() => ({ rows: [{ cnt: 0 }] }));
+    `, [parentId]).catch(() => ({ rows: [{ cnt: 0 }] }));
 
     if ((rateRow?.cnt || 0) >= 2) {
       return res.status(429).json({ ok: false, error: { code: 'RATE_LIMITED', message: 'Ya generaste 2 reportes hoy. Volvé mañana.' } });
