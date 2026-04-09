@@ -8,6 +8,7 @@ const db        = require('../config/db');
 const auth      = require('../middleware/auth');
 const roles     = require('../middleware/roles');
 const { getIO } = require('../socket');
+const { getBalance, getAccountByUserId } = require('../services/balance');
 const router    = express.Router();
 
 // ── Lazy OpenAI init ─────────────────────────────────────────
@@ -490,14 +491,10 @@ router.get('/parent/snapshot', auth, roles('parent'), async (req, res) => {
     const children = await Promise.all(links.map(async child => {
       const sid = child.student_id;
 
-      // Balance from ledger
-      const balance = await db.query(`
-        SELECT COALESCE(
-          (SELECT COALESCE(SUM(amount),0) FROM transactions WHERE to_user_id = $1) -
-          (SELECT COALESCE(SUM(amount),0) FROM transactions WHERE from_user_id = $1),
-          0
-        )::int AS balance
-      `, [sid]).then(r => r.rows[0]?.balance ?? 0).catch(() => 0);
+      // Balance from ledger (double-entry source of truth)
+      const balance = await getAccountByUserId(sid)
+        .then(accountId => getBalance(accountId))
+        .catch(() => 0);
 
       // Mood avg last 7 days
       const moodData = await db.query(`
