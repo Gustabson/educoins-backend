@@ -149,6 +149,19 @@ db.query(`
   ON parent_teacher_messages(parent_id, student_id, teacher_id, created_at DESC)
 `).catch(e => console.warn('[diwy] idx_ptm_thread:', e.message));
 
+db.query(`
+  CREATE TABLE IF NOT EXISTS parent_admin_contacts (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    parent_id   UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    student_id  UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    admin_id    UUID REFERENCES users(id) ON DELETE SET NULL,
+    sender_role TEXT NOT NULL CHECK (sender_role IN ('parent', 'admin')),
+    content     TEXT NOT NULL,
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    read_at     TIMESTAMPTZ
+  )
+`).catch(e => console.warn('[diwy] parent_admin_contacts table:', e.message));
+
 // ── Helper: Monday of the current week ───────────────────────
 function getMondayISO() {
   const d = new Date();
@@ -1610,6 +1623,169 @@ router.post('/teacher/parent-messages/reply', auth, roles('admin', 'teacher'), a
     res.json({ ok:true, data: msg });
   } catch(e) {
     console.error('[diwy] POST /teacher/parent-messages/reply:', e);
+    res.status(500).json({ ok:false, error:{ code:'SERVER_ERROR', message:e.message } });
+  }
+});
+
+// ── POST /parent/admin-contact — parent sends message to institution ────────
+router.post('/parent/admin-contact', auth, roles('parent'), async (req, res) => {
+  try {
+    const parentId = req.user.id;
+    const { studentId, content } = req.body;
+    if (!studentId || !content?.trim()) {
+      return res.status(400).json({ ok:false, error:{ code:'MISSING_FIELDS', message:'studentId y content requeridos' } });
+    }
+    const { rows: link } = await db.query(
+      'SELECT 1 FROM parent_student_links WHERE parent_id=$1 AND student_id=$2',
+      [parentId, studentId]
+    );
+    if (!link.length) return res.status(403).json({ ok:false, error:{ code:'UNAUTHORIZED', message:'No autorizado' } });
+
+    const { rows:[msg] } = await db.query(`
+      INSERT INTO parent_admin_contacts (parent_id, student_id, sender_role, content)
+      VALUES ($1, $2, 'parent', $3)
+      RETURNING id, parent_id, student_id, admin_id, sender_role, content, created_at
+    `, [parentId, studentId, content.trim()]);
+
+    // Notify all active admins in real time
+    const io = getIO();
+    if (io) {
+      const { rows:[parent] } = await db.query('SELECT nombre FROM users WHERE id=$1', [parentId]);
+      const { rows:[student] } = await db.query('SELECT nombre FROM users WHERE id=$1', [studentId]);
+      const { rows: admins } = await db.query("SELECT id FROM users WHERE rol='admin' AND activo=TRUE");
+      admins.forEach(a => io.to(`user:${a.id}`).emit('parent_admin_message', {
+        message_id: msg.id, parent_nombre: parent?.nombre, student_nombre: student?.nombre,
+        content: msg.content, created_at: msg.created_at,
+      }));
+    }
+    res.json({ ok:true, data: msg });
+  } catch(e) {
+    console.error('[diwy] POST /parent/admin-contact:', e);
+    res.status(500).json({ ok:false, error:{ code:'SERVER_ERROR', message:e.message } });
+  }
+});
+
+// ── GET /parent/admin-contacts — parent reads their thread with institution ──
+router.get('/parent/admin-contacts', auth, roles('parent'), async (req, res) => {
+  try {
+    const parentId = req.user.id;
+    const { studentId } = req.query;
+    if (!studentId) return res.status(400).json({ ok:false, error:{ code:'MISSING_FIELDS', message:'studentId requerido' } });
+    const { rows: link } = await db.query(
+      'SELECT 1 FROM parent_student_links WHERE parent_id=$1 AND student_id=$2',
+      [parentId, studentId]
+    );
+    if (!link.length) return res.status(403).json({ ok:false, error:{ code:'UNAUTHORIZED', message:'No autorizado' } });
+
+    // Mark admin replies as read
+    await db.query(`
+      UPDATE parent_admin_contacts SET read_at=NOW()
+      WHERE parent_id=$1 AND student_id=$2 AND sender_role='admin' AND read_at IS NULL
+    `, [parentId, studentId]).catch(() => {});
+
+    const { rows } = await db.query(`
+      SELECT m.id, m.sender_role, m.content, m.created_at,
+        CASE WHEN m.sender_role='parent' THEN pu.nombre ELSE au.nombre END AS sender_nombre
+      FROM parent_admin_contacts m
+      JOIN users pu ON pu.id = m.parent_id
+      LEFT JOIN users au ON au.id = m.admin_id
+      WHERE m.parent_id=$1 AND m.student_id=$2
+      ORDER BY m.created_at ASC
+    `, [parentId, studentId]);
+    res.json({ ok:true, data: rows });
+  } catch(e) {
+    console.error('[diwy] GET /parent/admin-contacts:', e);
+    res.status(500).json({ ok:false, error:{ code:'SERVER_ERROR', message:e.message } });
+  }
+});
+
+// ── GET /admin/parent-contacts — admin inbox ─────────────────────────────────
+router.get('/admin/parent-contacts', auth, roles('admin'), async (req, res) => {
+  try {
+    const { rows } = await db.query(`
+      SELECT
+        m.parent_id, m.student_id,
+        pu.nombre AS parent_nombre, su.nombre AS student_nombre,
+        MAX(m.created_at) AS last_at,
+        (SELECT content FROM parent_admin_contacts
+          WHERE parent_id=m.parent_id AND student_id=m.student_id
+          ORDER BY created_at DESC LIMIT 1) AS last_content,
+        (SELECT sender_role FROM parent_admin_contacts
+          WHERE parent_id=m.parent_id AND student_id=m.student_id
+          ORDER BY created_at DESC LIMIT 1) AS last_sender,
+        COUNT(*) FILTER (WHERE m.sender_role='parent' AND m.read_at IS NULL)::int AS unread
+      FROM parent_admin_contacts m
+      JOIN users pu ON pu.id = m.parent_id
+      JOIN users su ON su.id = m.student_id
+      GROUP BY m.parent_id, m.student_id, pu.nombre, su.nombre
+      ORDER BY MAX(m.created_at) DESC
+    `);
+    res.json({ ok:true, data: rows });
+  } catch(e) {
+    console.error('[diwy] GET /admin/parent-contacts:', e);
+    res.status(500).json({ ok:false, error:{ code:'SERVER_ERROR', message:e.message } });
+  }
+});
+
+// ── GET /admin/parent-contacts/thread ────────────────────────────────────────
+router.get('/admin/parent-contacts/thread', auth, roles('admin'), async (req, res) => {
+  try {
+    const adminId = req.user.id;
+    const { parentId, studentId } = req.query;
+    if (!parentId || !studentId) return res.status(400).json({ ok:false, error:{ code:'MISSING_FIELDS', message:'parentId y studentId requeridos' } });
+
+    await db.query(`
+      UPDATE parent_admin_contacts SET read_at=NOW()
+      WHERE parent_id=$1 AND student_id=$2 AND sender_role='parent' AND read_at IS NULL
+    `, [parentId, studentId]).catch(() => {});
+
+    const { rows } = await db.query(`
+      SELECT m.id, m.sender_role, m.content, m.created_at,
+        CASE WHEN m.sender_role='parent' THEN pu.nombre ELSE au.nombre END AS sender_nombre
+      FROM parent_admin_contacts m
+      JOIN users pu ON pu.id = m.parent_id
+      LEFT JOIN users au ON au.id = m.admin_id
+      WHERE m.parent_id=$1 AND m.student_id=$2
+      ORDER BY m.created_at ASC
+    `, [parentId, studentId]);
+    res.json({ ok:true, data: rows });
+  } catch(e) {
+    console.error('[diwy] GET /admin/parent-contacts/thread:', e);
+    res.status(500).json({ ok:false, error:{ code:'SERVER_ERROR', message:e.message } });
+  }
+});
+
+// ── POST /admin/parent-contacts/reply ────────────────────────────────────────
+router.post('/admin/parent-contacts/reply', auth, roles('admin'), async (req, res) => {
+  try {
+    const adminId = req.user.id;
+    const { parentId, studentId, content } = req.body;
+    if (!parentId || !studentId || !content?.trim()) {
+      return res.status(400).json({ ok:false, error:{ code:'MISSING_FIELDS', message:'Faltan campos' } });
+    }
+    const { rows: exists } = await db.query(
+      'SELECT 1 FROM parent_admin_contacts WHERE parent_id=$1 AND student_id=$2 LIMIT 1',
+      [parentId, studentId]
+    );
+    if (!exists.length) return res.status(404).json({ ok:false, error:{ code:'NO_THREAD', message:'No existe este hilo' } });
+
+    const { rows:[msg] } = await db.query(`
+      INSERT INTO parent_admin_contacts (parent_id, student_id, admin_id, sender_role, content)
+      VALUES ($1, $2, $3, 'admin', $4)
+      RETURNING id, sender_role, content, created_at
+    `, [parentId, studentId, adminId, content.trim()]);
+
+    const io = getIO();
+    if (io) {
+      const { rows:[admin] } = await db.query('SELECT nombre FROM users WHERE id=$1', [adminId]);
+      io.to(`user:${parentId}`).emit('admin_contact_reply', {
+        message_id: msg.id, admin_nombre: admin?.nombre,
+        student_id: studentId, content: msg.content, created_at: msg.created_at,
+      });
+    }
+    res.json({ ok:true, data: msg });
+  } catch(e) {
+    console.error('[diwy] POST /admin/parent-contacts/reply:', e);
     res.status(500).json({ ok:false, error:{ code:'SERVER_ERROR', message:e.message } });
   }
 });
