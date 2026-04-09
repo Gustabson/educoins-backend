@@ -131,6 +131,24 @@ db.query(`
   )
 `).catch(e => console.warn('[diwy] diwy_parent_asks table:', e.message));
 
+db.query(`
+  CREATE TABLE IF NOT EXISTS parent_teacher_messages (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    parent_id   UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    student_id  UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    teacher_id  UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    sender_role TEXT NOT NULL CHECK (sender_role IN ('parent', 'teacher')),
+    content     TEXT NOT NULL,
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    read_at     TIMESTAMPTZ
+  )
+`).catch(e => console.warn('[diwy] parent_teacher_messages table:', e.message));
+
+db.query(`
+  CREATE INDEX IF NOT EXISTS idx_ptm_thread
+  ON parent_teacher_messages(parent_id, student_id, teacher_id, created_at DESC)
+`).catch(e => console.warn('[diwy] idx_ptm_thread:', e.message));
+
 // ── Helper: Monday of the current week ───────────────────────
 function getMondayISO() {
   const d = new Date();
@@ -1358,6 +1376,240 @@ router.patch('/admin/attendance/edit-requests/:id', auth, roles('admin'), async 
 
     res.json({ ok:true, data:updated });
   } catch(e) {
+    res.status(500).json({ ok:false, error:{ code:'SERVER_ERROR', message:e.message } });
+  }
+});
+
+// ── GET /parent/child-teachers — teachers in child's classrooms ───────────
+router.get('/parent/child-teachers', auth, roles('parent'), async (req, res) => {
+  try {
+    const parentId = req.user.id;
+    const { studentId } = req.query;
+    if (!studentId) return res.status(400).json({ ok:false, error:{ code:'MISSING_FIELDS', message:'studentId requerido' } });
+
+    // Verify link
+    const { rows: link } = await db.query(
+      'SELECT 1 FROM parent_student_links WHERE parent_id=$1 AND student_id=$2',
+      [parentId, studentId]
+    );
+    if (!link.length) return res.status(403).json({ ok:false, error:{ code:'UNAUTHORIZED', message:'No autorizado' } });
+
+    // Teachers who share a classroom with this student
+    const { rows } = await db.query(`
+      SELECT DISTINCT u.id, u.nombre
+      FROM users u
+      JOIN classroom_members cm_t ON cm_t.user_id = u.id
+      JOIN classrooms c           ON c.id = cm_t.classroom_id AND c.activa = TRUE
+      JOIN classroom_members cm_s ON cm_s.classroom_id = c.id AND cm_s.user_id = $1
+      WHERE u.rol = 'teacher' AND u.activo = TRUE
+      ORDER BY u.nombre
+    `, [studentId]);
+    res.json({ ok:true, data: rows });
+  } catch(e) {
+    console.error('[diwy] GET /parent/child-teachers:', e);
+    res.status(500).json({ ok:false, error:{ code:'SERVER_ERROR', message:e.message } });
+  }
+});
+
+// ── POST /parent/direct-message — parent sends formal message to teacher ───
+router.post('/parent/direct-message', auth, roles('parent'), async (req, res) => {
+  try {
+    const parentId = req.user.id;
+    const { studentId, teacherId, content } = req.body;
+    if (!studentId || !teacherId || !content?.trim()) {
+      return res.status(400).json({ ok:false, error:{ code:'MISSING_FIELDS', message:'studentId, teacherId y content son requeridos' } });
+    }
+
+    // Verify link
+    const { rows: link } = await db.query(
+      'SELECT 1 FROM parent_student_links WHERE parent_id=$1 AND student_id=$2',
+      [parentId, studentId]
+    );
+    if (!link.length) return res.status(403).json({ ok:false, error:{ code:'UNAUTHORIZED', message:'No autorizado' } });
+
+    // Rate limit: 5 messages per parent per day across all teachers
+    const { rows:[rateRow] } = await db.query(`
+      SELECT COUNT(*)::int AS cnt FROM parent_teacher_messages
+      WHERE parent_id=$1 AND sender_role='parent'
+        AND created_at > NOW() - INTERVAL '1 day'
+    `, [parentId]).catch(() => ({ rows:[{ cnt:0 }] }));
+    if ((rateRow?.cnt||0) >= 5) {
+      return res.status(429).json({ ok:false, error:{ code:'RATE_LIMITED', message:'Límite de 5 mensajes por día alcanzado.' } });
+    }
+
+    const { rows:[msg] } = await db.query(`
+      INSERT INTO parent_teacher_messages (parent_id, student_id, teacher_id, sender_role, content)
+      VALUES ($1, $2, $3, 'parent', $4)
+      RETURNING id, parent_id, student_id, teacher_id, sender_role, content, created_at
+    `, [parentId, studentId, teacherId, content.trim()]);
+
+    // Notify teacher in real time
+    const io = getIO();
+    if (io) {
+      const { rows:[parent] } = await db.query('SELECT nombre FROM users WHERE id=$1', [parentId]);
+      const { rows:[student] } = await db.query('SELECT nombre FROM users WHERE id=$1', [studentId]);
+      io.to(`user:${teacherId}`).emit('parent_direct_message', {
+        message_id:   msg.id,
+        parent_nombre: parent?.nombre,
+        student_nombre: student?.nombre,
+        content:      msg.content,
+        created_at:   msg.created_at,
+      });
+    }
+
+    res.json({ ok:true, data: msg });
+  } catch(e) {
+    console.error('[diwy] POST /parent/direct-message:', e);
+    res.status(500).json({ ok:false, error:{ code:'SERVER_ERROR', message:e.message } });
+  }
+});
+
+// ── GET /parent/direct-messages — thread between parent, student, teacher ──
+router.get('/parent/direct-messages', auth, roles('parent'), async (req, res) => {
+  try {
+    const parentId = req.user.id;
+    const { studentId, teacherId } = req.query;
+    if (!studentId || !teacherId) {
+      return res.status(400).json({ ok:false, error:{ code:'MISSING_FIELDS', message:'studentId y teacherId requeridos' } });
+    }
+
+    // Verify link
+    const { rows: link } = await db.query(
+      'SELECT 1 FROM parent_student_links WHERE parent_id=$1 AND student_id=$2',
+      [parentId, studentId]
+    );
+    if (!link.length) return res.status(403).json({ ok:false, error:{ code:'UNAUTHORIZED', message:'No autorizado' } });
+
+    // Mark teacher messages as read
+    await db.query(`
+      UPDATE parent_teacher_messages SET read_at = NOW()
+      WHERE parent_id=$1 AND student_id=$2 AND teacher_id=$3
+        AND sender_role='teacher' AND read_at IS NULL
+    `, [parentId, studentId, teacherId]).catch(() => {});
+
+    const { rows } = await db.query(`
+      SELECT m.id, m.sender_role, m.content, m.created_at, m.read_at,
+        CASE WHEN m.sender_role='parent' THEN pu.nombre ELSE tu.nombre END AS sender_nombre
+      FROM parent_teacher_messages m
+      JOIN users pu ON pu.id = m.parent_id
+      JOIN users tu ON tu.id = m.teacher_id
+      WHERE m.parent_id=$1 AND m.student_id=$2 AND m.teacher_id=$3
+      ORDER BY m.created_at ASC
+    `, [parentId, studentId, teacherId]);
+
+    res.json({ ok:true, data: rows });
+  } catch(e) {
+    console.error('[diwy] GET /parent/direct-messages:', e);
+    res.status(500).json({ ok:false, error:{ code:'SERVER_ERROR', message:e.message } });
+  }
+});
+
+// ── GET /teacher/parent-messages — teacher inbox ────────────────────────────
+router.get('/teacher/parent-messages', auth, roles('admin', 'teacher'), async (req, res) => {
+  try {
+    const teacherId = req.user.id;
+
+    // Get latest message per thread (parent+student combo), with unread count
+    const { rows } = await db.query(`
+      SELECT
+        m.parent_id, m.student_id,
+        pu.nombre AS parent_nombre,
+        su.nombre AS student_nombre,
+        MAX(m.created_at) AS last_at,
+        (SELECT content FROM parent_teacher_messages
+          WHERE parent_id=m.parent_id AND student_id=m.student_id AND teacher_id=$1
+          ORDER BY created_at DESC LIMIT 1) AS last_content,
+        (SELECT sender_role FROM parent_teacher_messages
+          WHERE parent_id=m.parent_id AND student_id=m.student_id AND teacher_id=$1
+          ORDER BY created_at DESC LIMIT 1) AS last_sender,
+        COUNT(*) FILTER (WHERE m.sender_role='parent' AND m.read_at IS NULL)::int AS unread
+      FROM parent_teacher_messages m
+      JOIN users pu ON pu.id = m.parent_id
+      JOIN users su ON su.id = m.student_id
+      WHERE m.teacher_id = $1
+      GROUP BY m.parent_id, m.student_id, pu.nombre, su.nombre
+      ORDER BY MAX(m.created_at) DESC
+    `, [teacherId]);
+
+    res.json({ ok:true, data: rows });
+  } catch(e) {
+    console.error('[diwy] GET /teacher/parent-messages:', e);
+    res.status(500).json({ ok:false, error:{ code:'SERVER_ERROR', message:e.message } });
+  }
+});
+
+// ── GET /teacher/parent-messages/thread — full thread ──────────────────────
+router.get('/teacher/parent-messages/thread', auth, roles('admin', 'teacher'), async (req, res) => {
+  try {
+    const teacherId = req.user.id;
+    const { parentId, studentId } = req.query;
+    if (!parentId || !studentId) {
+      return res.status(400).json({ ok:false, error:{ code:'MISSING_FIELDS', message:'parentId y studentId requeridos' } });
+    }
+
+    // Mark parent messages as read
+    await db.query(`
+      UPDATE parent_teacher_messages SET read_at = NOW()
+      WHERE teacher_id=$1 AND parent_id=$2 AND student_id=$3
+        AND sender_role='parent' AND read_at IS NULL
+    `, [teacherId, parentId, studentId]).catch(() => {});
+
+    const { rows } = await db.query(`
+      SELECT m.id, m.sender_role, m.content, m.created_at,
+        CASE WHEN m.sender_role='parent' THEN pu.nombre ELSE tu.nombre END AS sender_nombre
+      FROM parent_teacher_messages m
+      JOIN users pu ON pu.id = m.parent_id
+      JOIN users tu ON tu.id = m.teacher_id
+      WHERE m.teacher_id=$1 AND m.parent_id=$2 AND m.student_id=$3
+      ORDER BY m.created_at ASC
+    `, [teacherId, parentId, studentId]);
+
+    res.json({ ok:true, data: rows });
+  } catch(e) {
+    console.error('[diwy] GET /teacher/parent-messages/thread:', e);
+    res.status(500).json({ ok:false, error:{ code:'SERVER_ERROR', message:e.message } });
+  }
+});
+
+// ── POST /teacher/parent-messages/reply — teacher replies ──────────────────
+router.post('/teacher/parent-messages/reply', auth, roles('admin', 'teacher'), async (req, res) => {
+  try {
+    const teacherId = req.user.id;
+    const { parentId, studentId, content } = req.body;
+    if (!parentId || !studentId || !content?.trim()) {
+      return res.status(400).json({ ok:false, error:{ code:'MISSING_FIELDS', message:'parentId, studentId y content requeridos' } });
+    }
+
+    // Verify a thread exists
+    const { rows: exists } = await db.query(
+      'SELECT 1 FROM parent_teacher_messages WHERE teacher_id=$1 AND parent_id=$2 AND student_id=$3 LIMIT 1',
+      [teacherId, parentId, studentId]
+    );
+    if (!exists.length) return res.status(403).json({ ok:false, error:{ code:'NO_THREAD', message:'No existe un hilo con este padre' } });
+
+    const { rows:[msg] } = await db.query(`
+      INSERT INTO parent_teacher_messages (parent_id, student_id, teacher_id, sender_role, content)
+      VALUES ($1, $2, $3, 'teacher', $4)
+      RETURNING id, sender_role, content, created_at
+    `, [parentId, studentId, teacherId, content.trim()]);
+
+    // Notify parent
+    const io = getIO();
+    if (io) {
+      const { rows:[teacher] } = await db.query('SELECT nombre FROM users WHERE id=$1', [teacherId]);
+      io.to(`user:${parentId}`).emit('teacher_direct_reply', {
+        message_id:     msg.id,
+        teacher_id:     teacherId,
+        teacher_nombre: teacher?.nombre,
+        student_id:     studentId,
+        content:        msg.content,
+        created_at:     msg.created_at,
+      });
+    }
+
+    res.json({ ok:true, data: msg });
+  } catch(e) {
+    console.error('[diwy] POST /teacher/parent-messages/reply:', e);
     res.status(500).json({ ok:false, error:{ code:'SERVER_ERROR', message:e.message } });
   }
 });
