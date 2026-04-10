@@ -211,6 +211,21 @@ router.get('/children-verdicts', async (req, res) => {
   }
 });
 
+// ── PATCH /parent/children-verdicts/read — mark all children verdicts as read ──
+router.patch('/children-verdicts/read', async (req, res) => {
+  try {
+    await db.query(`
+      UPDATE verdicts SET read_at = NOW()
+      WHERE to_user_id IN (
+        SELECT student_id FROM parent_student_links WHERE parent_id=$1
+      ) AND read_at IS NULL
+    `, [req.user.id]);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 // ── POST /parent/burn ─────────────────────────────────────────
 // Quema monedas propias del padre
 router.post('/burn', async (req, res) => {

@@ -19,7 +19,7 @@ router.get('/badge-counts', auth, async (req, res) => {
     const rol = req.user.rol;
 
     // Run all counts in parallel
-    const [diwyRes, verdictRes, sugRes, postRes, exchRes] = await Promise.all([
+    const [diwyRes, verdictRes, sugRes, postRes, exchRes, contactoRes] = await Promise.all([
       // Diwy: unread diwy_reply notifications
       db.query(
         `SELECT COUNT(*)::int AS cnt FROM notifications WHERE user_id=$1 AND tipo='diwy_reply' AND leida=false`,
@@ -51,6 +51,18 @@ router.get('/badge-counts', auth, async (req, res) => {
             OR (seller_id=$1 AND status='payment_sent')`,
         [uid]
       ),
+      // Contacto: unread messages from teacher or admin (parent only)
+      rol === 'parent'
+        ? db.query(`
+            SELECT (
+              (SELECT COUNT(*)::int FROM parent_teacher_messages
+               WHERE parent_id=$1 AND sender_role='teacher' AND read_at IS NULL)
+              +
+              (SELECT COUNT(*)::int FROM parent_admin_contacts
+               WHERE parent_id=$1 AND sender_role='admin' AND read_at IS NULL)
+            ) AS cnt
+          `, [uid])
+        : Promise.resolve({ rows: [{ cnt: 0 }] }),
     ]);
 
     res.json({ ok: true, data: {
@@ -59,6 +71,7 @@ router.get('/badge-counts', auth, async (req, res) => {
       sugerencias:sugRes.rows[0].cnt,
       noticias:   postRes.rows[0].cnt,
       exchange:   exchRes.rows[0].cnt,
+      contacto:   contactoRes.rows[0].cnt,
     }});
   } catch (e) {
     console.error('[badge-counts]', e);
