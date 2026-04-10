@@ -191,7 +191,9 @@ router.delete('/link-requests/:id', async (req, res) => {
 });
 
 // ── GET /parent/children-verdicts ────────────────────────────
-// Veredictos de todos los hijos vinculados
+// Veredictos de todos los hijos vinculados.
+// Marks all as read (fire-and-forget) so the badge clears on the NEXT home load,
+// while still returning the pre-read data so "NUEVO" labels show on first visit.
 router.get('/children-verdicts', async (req, res) => {
   try {
     const { rows } = await db.query(`
@@ -206,6 +208,14 @@ router.get('/children-verdicts', async (req, res) => {
       ORDER BY v.created_at DESC
     `, [req.user.id]);
     res.json({ ok: true, data: rows });
+    // Fire-and-forget: mark all unread verdicts as read so badge clears next time PHome loads.
+    // Runs AFTER res.json() so the response already contains the original unread status.
+    db.query(`
+      UPDATE verdicts SET read_at = NOW()
+      WHERE to_user_id IN (
+        SELECT student_id FROM parent_student_links WHERE parent_id=$1
+      ) AND read_at IS NULL
+    `, [req.user.id]).catch(() => {});
   } catch (err) {
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }
