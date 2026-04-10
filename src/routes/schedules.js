@@ -12,20 +12,21 @@ const db      = require('../config/db');
 const auth    = require('../middleware/auth');
 
 // Auto-migrate: drop old slot-based table, create turno-based one
-db.query(`DROP TABLE IF EXISTS user_schedules`).catch(() => {});
-db.query(`
-  CREATE TABLE IF NOT EXISTS user_schedules (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    turno       TEXT NOT NULL CHECK (turno IN ('manana','tarde','noche','extra')),
-    day_of_week SMALLINT NOT NULL CHECK (day_of_week BETWEEN 0 AND 6),
-    subject     TEXT NOT NULL,
-    time_from   TEXT,
-    time_to     TEXT,
-    color       TEXT DEFAULT '#3b82f6',
-    created_at  TIMESTAMPTZ DEFAULT NOW()
-  )
-`).catch(e => console.warn('[schedules] migration:', e.message));
+db.query(`DROP TABLE IF EXISTS user_schedules`)
+  .then(() => db.query(`
+    CREATE TABLE IF NOT EXISTS user_schedules (
+      id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      turno       TEXT NOT NULL CHECK (turno IN ('manana','tarde','noche','extra')),
+      day_of_week SMALLINT NOT NULL CHECK (day_of_week BETWEEN 0 AND 6),
+      subject     TEXT NOT NULL,
+      time_from   TEXT,
+      time_to     TEXT,
+      color       TEXT DEFAULT '#3b82f6',
+      created_at  TIMESTAMPTZ DEFAULT NOW()
+    )
+  `))
+  .catch(e => console.warn('[schedules] migration:', e.message));
 
 // ── GET / ─────────────────────────────────────────────────────
 router.get('/', auth, async (req, res) => {
