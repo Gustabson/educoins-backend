@@ -5,13 +5,15 @@
 // POST   /schedules        → create one entry
 // PATCH  /schedules/:id    → update one entry
 // DELETE /schedules/:id    → remove one entry
+// GET    /schedules/prefs  → UI preferences (view mode, turno order)
+// PATCH  /schedules/prefs  → save UI preferences
 
 const express = require('express');
 const router  = express.Router();
 const db      = require('../config/db');
 const auth    = require('../middleware/auth');
 
-// Auto-migrate: drop old slot-based table, create turno-based one
+// Auto-migrate
 db.query(`DROP TABLE IF EXISTS user_schedules`)
   .then(() => db.query(`
     CREATE TABLE IF NOT EXISTS user_schedules (
@@ -27,6 +29,42 @@ db.query(`DROP TABLE IF EXISTS user_schedules`)
     )
   `))
   .catch(e => console.warn('[schedules] migration:', e.message));
+
+// Add ui_prefs column to users for storing schedule view preferences
+db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ui_prefs JSONB DEFAULT '{}'::jsonb`)
+  .catch(e => console.warn('[schedules] ui_prefs migration:', e.message));
+
+// ── GET /prefs ────────────────────────────────────────────────
+router.get('/prefs', auth, async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      'SELECT ui_prefs FROM users WHERE id=$1', [req.user.id]
+    );
+    res.json({ ok: true, data: rows[0]?.ui_prefs || {} });
+  } catch (e) {
+    console.error('[schedules] GET prefs:', e);
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: e.message } });
+  }
+});
+
+// ── PATCH /prefs ──────────────────────────────────────────────
+router.patch('/prefs', auth, async (req, res) => {
+  try {
+    const patch = {};
+    if (req.body.sch_view)         patch.sch_view         = req.body.sch_view;
+    if (req.body.sch_turno_order)  patch.sch_turno_order  = req.body.sch_turno_order;
+    const { rows } = await db.query(`
+      UPDATE users
+      SET ui_prefs = COALESCE(ui_prefs, '{}'::jsonb) || $1::jsonb
+      WHERE id=$2
+      RETURNING ui_prefs
+    `, [JSON.stringify(patch), req.user.id]);
+    res.json({ ok: true, data: rows[0]?.ui_prefs || {} });
+  } catch (e) {
+    console.error('[schedules] PATCH prefs:', e);
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: e.message } });
+  }
+});
 
 // ── GET / ─────────────────────────────────────────────────────
 router.get('/', auth, async (req, res) => {
