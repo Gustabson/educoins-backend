@@ -50,9 +50,14 @@ router.get('/prefs', auth, async (req, res) => {
 // ── PATCH /prefs ──────────────────────────────────────────────
 router.patch('/prefs', auth, async (req, res) => {
   try {
+    const allowed = ['sch_view', 'sch_turno_order', 'sch_periods', 'sch_locked'];
     const patch = {};
-    if (req.body.sch_view)         patch.sch_view         = req.body.sch_view;
-    if (req.body.sch_turno_order)  patch.sch_turno_order  = req.body.sch_turno_order;
+    for (const key of allowed) {
+      if (req.body[key] !== undefined) patch[key] = req.body[key];
+    }
+    if (Object.keys(patch).length === 0) {
+      return res.status(400).json({ ok: false, error: { code: 'MISSING_FIELDS', message: 'Sin campos para actualizar' } });
+    }
     const { rows } = await db.query(`
       UPDATE users
       SET ui_prefs = COALESCE(ui_prefs, '{}'::jsonb) || $1::jsonb
@@ -120,6 +125,24 @@ router.patch('/:id', auth, async (req, res) => {
     res.json({ ok: true, data: entry });
   } catch (e) {
     console.error('[schedules] PATCH:', e);
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: e.message } });
+  }
+});
+
+// ── DELETE /by-period — remove all entries for a turno+time ──
+router.delete('/by-period', auth, async (req, res) => {
+  try {
+    const { turno, time_from } = req.body;
+    if (!turno || !time_from) {
+      return res.status(400).json({ ok: false, error: { code: 'MISSING_FIELDS', message: 'turno y time_from son requeridos' } });
+    }
+    await db.query(
+      'DELETE FROM user_schedules WHERE user_id=$1 AND turno=$2 AND time_from=$3',
+      [req.user.id, turno, time_from]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[schedules] DELETE by-period:', e);
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: e.message } });
   }
 });
