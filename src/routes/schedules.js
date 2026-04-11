@@ -51,7 +51,7 @@ router.get('/prefs', auth, async (req, res) => {
 router.patch('/prefs', auth, async (req, res) => {
   try {
     const allowed = ['sch_view', 'sch_turno_order', 'sch_periods', 'sch_locked',
-                     'sch_show_sat', 'sch_show_dom', 'sch_grid_rotated'];
+                     'sch_show_sat', 'sch_show_dom', 'sch_grid_rotated', 'sch_grid_css_angle'];
     const patch = {};
     for (const key of allowed) {
       if (req.body[key] !== undefined) patch[key] = req.body[key];
