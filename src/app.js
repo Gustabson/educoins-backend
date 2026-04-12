@@ -67,6 +67,7 @@ app.use('/api/v1/ai',           require('./routes/ai'));
 app.use('/api/v1/ai-docs',      require('./routes/ai-docs'));
 app.use('/api/v1/diwy',         require('./routes/diwy'));
 app.use('/api/v1/schedules',    require('./routes/schedules'));
+app.use('/api/v1/academic',     require('./routes/academic'));
 
 // ── One-time migrations ───────────────────────────────────────
 // Unify legacy 'maestra' role → 'teacher'
