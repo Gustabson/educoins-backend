@@ -13,22 +13,20 @@ const router  = express.Router();
 const db      = require('../config/db');
 const auth    = require('../middleware/auth');
 
-// Auto-migrate
-db.query(`DROP TABLE IF EXISTS user_schedules`)
-  .then(() => db.query(`
-    CREATE TABLE IF NOT EXISTS user_schedules (
-      id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      turno       TEXT NOT NULL CHECK (turno IN ('manana','tarde','noche','extra')),
-      day_of_week SMALLINT NOT NULL CHECK (day_of_week BETWEEN 0 AND 6),
-      subject     TEXT NOT NULL,
-      time_from   TEXT,
-      time_to     TEXT,
-      color       TEXT DEFAULT '#3b82f6',
-      created_at  TIMESTAMPTZ DEFAULT NOW()
-    )
-  `))
-  .catch(e => console.warn('[schedules] migration:', e.message));
+// Auto-migrate — never drop, only create if absent
+db.query(`
+  CREATE TABLE IF NOT EXISTS user_schedules (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    turno       TEXT NOT NULL CHECK (turno IN ('manana','tarde','noche','extra')),
+    day_of_week SMALLINT NOT NULL CHECK (day_of_week BETWEEN 0 AND 6),
+    subject     TEXT NOT NULL,
+    time_from   TEXT,
+    time_to     TEXT,
+    color       TEXT DEFAULT '#3b82f6',
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+  )
+`).catch(e => console.warn('[schedules] migration:', e.message));
 
 // Add ui_prefs column to users for storing schedule view preferences
 db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ui_prefs JSONB DEFAULT '{}'::jsonb`)
@@ -51,7 +49,8 @@ router.get('/prefs', auth, async (req, res) => {
 router.patch('/prefs', auth, async (req, res) => {
   try {
     const allowed = ['sch_view', 'sch_turno_order', 'sch_periods', 'sch_locked',
-                     'sch_show_sat', 'sch_show_dom', 'sch_grid_rotated', 'sch_grid_css_angle'];
+                     'sch_show_sat', 'sch_show_dom', 'sch_grid_rotated', 'sch_grid_css_angle',
+                     'accesos_order'];
     const patch = {};
     for (const key of allowed) {
       if (req.body[key] !== undefined) patch[key] = req.body[key];
