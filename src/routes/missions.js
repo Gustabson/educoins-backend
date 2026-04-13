@@ -19,6 +19,12 @@ db.query(`ALTER TABLE missions ADD COLUMN IF NOT EXISTS reward_type TEXT DEFAULT
   .catch(e => console.warn('[missions] migration reward_type:', e.message));
 db.query(`ALTER TABLE missions ADD COLUMN IF NOT EXISTS reward_extra JSONB`)
   .catch(e => console.warn('[missions] migration reward_extra:', e.message));
+db.query(`ALTER TABLE missions ADD COLUMN IF NOT EXISTS fecha_inicio TIMESTAMPTZ`)
+  .catch(e => console.warn('[missions] migration fecha_inicio:', e.message));
+// Drop old tipo constraint and recreate with new tipos
+db.query(`ALTER TABLE missions DROP CONSTRAINT IF EXISTS missions_tipo_check`)
+  .then(() => db.query(`ALTER TABLE missions ADD CONSTRAINT missions_tipo_check CHECK (tipo IN ('normal','limitada','grupal','encadenada','rol','rapida'))`))
+  .catch(e => console.warn('[missions] tipo constraint update:', e.message));
 
 function notify(userId, payload) {
   try { const io=getIO(); if(io) io.to(`user:${userId}`).emit('notification',payload); } catch(e){}
@@ -52,6 +58,7 @@ router.get('/', auth, async (req, res) => {
           SELECT 1 FROM mission_submissions pms WHERE pms.mission_id=m.prerequisite_id AND pms.student_id=$1 AND pms.estado='aprobada'
         ))
         AND (m.fecha_fin IS NULL OR m.fecha_fin > NOW() OR ms.estado='aprobada')
+        AND (m.fecha_inicio IS NULL OR m.fecha_inicio <= NOW())
       ORDER BY CASE m.tipo WHEN 'limitada' THEN 0 WHEN 'grupal' THEN 1 ELSE 2 END, m.created_at DESC
     `, [req.user.id, tipo]);
     res.json({ ok: true, data: rows });
@@ -109,18 +116,20 @@ router.post('/', auth, roles('teacher','admin'), async (req, res) => {
             tipo='normal', fecha_fin=null, max_submissions=null,
             classroom_id=null, prerequisite_id=null, xp_bonus=0,
             imagen_url=null, icon='⚡', auto_approve=false,
-            reward_type='monedas', reward_extra=null } = req.body;
+            reward_type='monedas', reward_extra=null,
+            fecha_inicio=null } = req.body;
     if (!titulo || !recompensa || !dificultad)
       return res.status(400).json({ ok: false, error: { code: 'MISSING_FIELDS' } });
     const { rows } = await db.query(`
       INSERT INTO missions (id,titulo,descripcion,recompensa,dificultad,created_by,
         tipo,fecha_fin,max_submissions,classroom_id,prerequisite_id,xp_bonus,
-        imagen_url,icon,auto_approve,reward_type,reward_extra)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *
+        imagen_url,icon,auto_approve,reward_type,reward_extra,fecha_inicio)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING *
     `, [uuidv4(),titulo,descripcion,recompensa,dificultad,req.user.id,
         tipo,fecha_fin,max_submissions,classroom_id,prerequisite_id,xp_bonus||0,
         imagen_url,icon||'⚡',auto_approve||false,reward_type||'monedas',
-        reward_extra ? JSON.stringify(reward_extra) : null]);
+        reward_extra ? JSON.stringify(reward_extra) : null,
+        fecha_inicio||null]);
     res.status(201).json({ ok: true, data: rows[0] });
   } catch (err) {
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
@@ -130,16 +139,35 @@ router.post('/', auth, roles('teacher','admin'), async (req, res) => {
 // PATCH /missions/:id
 router.patch('/:id', auth, roles('teacher','admin'), async (req, res) => {
   try {
-    const { titulo, descripcion, recompensa, activa, fecha_fin } = req.body;
+    const { titulo, descripcion, recompensa, activa, fecha_fin, fecha_inicio, icon, imagen_url, auto_approve, max_submissions } = req.body;
     const isAdmin = req.user.rol==='admin';
     const { rows } = await db.query(`
       UPDATE missions SET
         titulo=COALESCE($1,titulo), descripcion=COALESCE($2,descripcion),
-        recompensa=COALESCE($3,recompensa), activa=COALESCE($4,activa), fecha_fin=COALESCE($5,fecha_fin)
+        recompensa=COALESCE($3,recompensa), activa=COALESCE($4,activa), fecha_fin=COALESCE($5,fecha_fin),
+        fecha_inicio=COALESCE($9,fecha_inicio), icon=COALESCE($10,icon),
+        imagen_url=COALESCE($11,imagen_url), auto_approve=COALESCE($12,auto_approve),
+        max_submissions=COALESCE($13,max_submissions)
       WHERE id=$6 AND (created_by=$7 OR $8) RETURNING *
-    `, [titulo,descripcion,recompensa,activa,fecha_fin,req.params.id,req.user.id,isAdmin]);
+    `, [titulo,descripcion,recompensa,activa,fecha_fin,req.params.id,req.user.id,isAdmin,
+        fecha_inicio,icon,imagen_url,auto_approve,max_submissions]);
     if (!rows.length) return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND' } });
     res.json({ ok: true, data: rows[0] });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// DELETE /missions/:id
+router.delete('/:id', auth, roles('teacher','admin'), async (req, res) => {
+  try {
+    const isAdmin = req.user.rol === 'admin';
+    const { rows } = await db.query(
+      'DELETE FROM missions WHERE id=$1 AND (created_by=$2 OR $3) RETURNING id',
+      [req.params.id, req.user.id, isAdmin]
+    );
+    if (!rows.length) return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND' } });
+    res.json({ ok: true, data: { id: rows[0].id } });
   } catch (err) {
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }
