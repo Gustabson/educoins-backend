@@ -43,7 +43,7 @@ router.get('/', auth, async (req, res) => {
   try {
     const tipo = req.query.tipo || null;
     const { rows } = await db.query(`
-      SELECT m.*, u.nombre AS creador_nombre,
+      SELECT m.*, u.nombre AS creador_nombre, u.rol AS creador_rol,
         ms.estado AS mi_estado, ms.id AS submission_id, ms.feedback AS mi_feedback,
         (SELECT COUNT(*) FROM mission_submissions ms2 WHERE ms2.mission_id=m.id AND ms2.estado='aprobada')::int AS total_completadas
       FROM missions m
@@ -70,13 +70,17 @@ router.get('/', auth, async (req, res) => {
 // GET /missions/teacher
 router.get('/teacher', auth, roles('teacher','admin'), async (req, res) => {
   try {
+    const isAdmin = req.user.rol === 'admin';
     const { rows } = await db.query(`
-      SELECT m.*,
+      SELECT m.*, u.nombre AS creador_nombre, u.rol AS creador_rol,
         (SELECT COUNT(*) FROM mission_submissions ms WHERE ms.mission_id=m.id AND ms.estado='pendiente')::int AS pendientes,
         (SELECT COUNT(*) FROM mission_submissions ms WHERE ms.mission_id=m.id AND ms.estado='aprobada')::int  AS aprobadas,
         (SELECT COUNT(*) FROM mission_submissions ms WHERE ms.mission_id=m.id AND ms.estado='rechazada')::int AS rechazadas
-      FROM missions m WHERE m.created_by=$1 ORDER BY m.created_at DESC
-    `, [req.user.id]);
+      FROM missions m
+      JOIN users u ON u.id = m.created_by
+      WHERE ($1 OR m.created_by=$2)
+      ORDER BY m.created_at DESC
+    `, [isAdmin, req.user.id]);
     res.json({ ok: true, data: rows });
   } catch (err) {
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
