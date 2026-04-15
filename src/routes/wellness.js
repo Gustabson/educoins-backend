@@ -155,7 +155,7 @@ router.post('/checkin', auth, async (req, res) => {
     if (coinsAwarded > 0) {
       const io = getIO();
       if (io) io.to(`user:${req.user.id}`).emit('notification', {
-        type:   'reward',
+        type:   'wellness_reward',
         amount:  coinsAwarded,
         message: `+${coinsAwarded} monedas por tu reporte de bienestar`,
       });
