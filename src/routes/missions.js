@@ -45,7 +45,15 @@ router.get('/', auth, async (req, res) => {
     const { rows } = await db.query(`
       SELECT m.*, u.nombre AS creador_nombre, u.rol AS creador_rol,
         ms.estado AS mi_estado, ms.id AS submission_id, ms.feedback AS mi_feedback,
-        (SELECT COUNT(*) FROM mission_submissions ms2 WHERE ms2.mission_id=m.id AND ms2.estado='aprobada')::int AS total_completadas
+        (SELECT COUNT(*) FROM mission_submissions ms2 WHERE ms2.mission_id=m.id AND ms2.estado='aprobada')::int AS total_completadas,
+        (SELECT mg.id FROM mission_group_members mgm
+         JOIN mission_groups mg ON mg.id=mgm.group_id
+         WHERE mgm.user_id=$1 AND mg.mission_id=m.id AND mg.status NOT IN ('rejected')
+         LIMIT 1) AS mi_group_id,
+        (SELECT mg.status FROM mission_group_members mgm
+         JOIN mission_groups mg ON mg.id=mgm.group_id
+         WHERE mgm.user_id=$1 AND mg.mission_id=m.id AND mg.status NOT IN ('rejected')
+         LIMIT 1) AS mi_group_status
       FROM missions m
       JOIN users u ON u.id=m.created_by
       LEFT JOIN mission_submissions ms ON ms.mission_id=m.id AND ms.student_id=$1
@@ -121,19 +129,24 @@ router.post('/', auth, roles('teacher','admin'), async (req, res) => {
             classroom_id=null, prerequisite_id=null, xp_bonus=0,
             imagen_url=null, icon='⚡', auto_approve=false,
             reward_type='monedas', reward_extra=null,
-            fecha_inicio=null } = req.body;
+            fecha_inicio=null,
+            grupo_min_size=2, grupo_max_size=2, requires_peer_eval=false } = req.body;
     if (!titulo || !recompensa || !dificultad)
       return res.status(400).json({ ok: false, error: { code: 'MISSING_FIELDS' } });
     const { rows } = await db.query(`
       INSERT INTO missions (id,titulo,descripcion,recompensa,dificultad,created_by,
         tipo,fecha_fin,max_submissions,classroom_id,prerequisite_id,xp_bonus,
-        imagen_url,icon,auto_approve,reward_type,reward_extra,fecha_inicio)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING *
+        imagen_url,icon,auto_approve,reward_type,reward_extra,fecha_inicio,
+        grupo_min_size,grupo_max_size,requires_peer_eval)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21) RETURNING *
     `, [uuidv4(),titulo,descripcion,recompensa,dificultad,req.user.id,
         tipo,fecha_fin,max_submissions,classroom_id,prerequisite_id,xp_bonus||0,
         imagen_url,icon||'⚡',auto_approve||false,reward_type||'monedas',
         reward_extra ? JSON.stringify(reward_extra) : null,
-        fecha_inicio||null]);
+        fecha_inicio||null,
+        tipo==='grupal'?(grupo_min_size||2):2,
+        tipo==='grupal'?(grupo_max_size||2):2,
+        tipo==='grupal'?(requires_peer_eval||false):false]);
     res.status(201).json({ ok: true, data: rows[0] });
   } catch (err) {
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
@@ -181,12 +194,52 @@ router.delete('/:id', auth, roles('teacher','admin'), async (req, res) => {
 router.post('/:id/submit', auth, roles('student'), async (req, res) => {
   const client = await db.getClient();
   try {
-    const { comentario } = req.body;
+    const { comentario, group_id } = req.body;
     const { rows: mRows } = await client.query('SELECT * FROM missions WHERE id=$1 AND activa=TRUE',[req.params.id]);
     if (!mRows.length) return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND' } });
     const mission = mRows[0];
     if (mission.fecha_fin && new Date(mission.fecha_fin) < new Date())
       return res.status(400).json({ ok: false, error: { code: 'EXPIRED', message: 'Esta mision ya vencio' } });
+
+    // ── Grupal mission: requires group_id ──────────────────────
+    if (mission.tipo === 'grupal') {
+      if (!group_id)
+        return res.status(400).json({ ok: false, error: { code: 'GROUP_REQUIRED', message: 'Las misiones grupales requieren un grupo formado' } });
+      // Validate group exists, is ready, and student is a member
+      const { rows: grpRows } = await client.query(
+        "SELECT * FROM mission_groups WHERE id=$1 AND mission_id=$2 AND status='ready'", [group_id, req.params.id]
+      );
+      if (!grpRows.length)
+        return res.status(400).json({ ok: false, error: { code: 'GROUP_NOT_READY', message: 'El grupo no esta listo (faltan aceptar invitaciones)' } });
+      const { rows: mem } = await client.query(
+        'SELECT user_id FROM mission_group_members WHERE group_id=$1 AND user_id=$2', [group_id, req.user.id]
+      );
+      if (!mem.length)
+        return res.status(403).json({ ok: false, error: { code: 'NOT_MEMBER' } });
+      // Check no duplicate submission for this group
+      const { rows: exGrp } = await client.query(
+        "SELECT id FROM mission_groups WHERE id=$1 AND submission_id IS NOT NULL", [group_id]
+      );
+      if (exGrp.length)
+        return res.status(422).json({ ok: false, error: { code: 'GROUP_ALREADY_SUBMITTED' } });
+
+      // Create submission (student_id = submitter, but reward goes to all members on approve)
+      await client.query('BEGIN');
+      const subId = uuidv4();
+      await client.query(
+        "INSERT INTO mission_submissions (id,mission_id,student_id,estado,feedback) VALUES ($1,$2,$3,'pendiente',$4)",
+        [subId, req.params.id, req.user.id, comentario||null]
+      );
+      await client.query(
+        "UPDATE mission_groups SET submission_id=$1, status='submitted' WHERE id=$2",
+        [subId, group_id]
+      );
+      await client.query('COMMIT');
+      notify(mission.created_by, { type:'new_submission', alumno:req.user.nombre, mision:mission.titulo, grupo: true });
+      return res.status(201).json({ ok: true, data: { id: subId, group_id } });
+    }
+
+    // ── Individual missions ────────────────────────────────────
     const { rows: ex } = await client.query(
       "SELECT id FROM mission_submissions WHERE mission_id=$1 AND student_id=$2 AND estado!='rechazada'",
       [req.params.id, req.user.id]
@@ -200,7 +253,6 @@ router.post('/:id/submit', auth, roles('student'), async (req, res) => {
     }
 
     if (mission.auto_approve) {
-      // Auto-approve: reward immediately
       await client.query('BEGIN');
       const txId = await ledger.reward({
         teacherId: mission.created_by, studentId: req.user.id,
@@ -254,7 +306,7 @@ router.post('/submissions/:id/approve', auth, roles('teacher','admin'), async (r
   try {
     const { feedback } = req.body;
     const { rows: sRows } = await client.query(`
-      SELECT ms.*, m.recompensa, m.titulo, m.xp_bonus, m.created_by
+      SELECT ms.*, m.recompensa, m.titulo, m.xp_bonus, m.created_by, m.tipo, m.requires_peer_eval
       FROM mission_submissions ms JOIN missions m ON ms.mission_id=m.id WHERE ms.id=$1
     `, [req.params.id]);
     if (!sRows.length) return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND' } });
@@ -263,7 +315,54 @@ router.post('/submissions/:id/approve', auth, roles('teacher','admin'), async (r
       return res.status(403).json({ ok: false, error: { code: 'UNAUTHORIZED' } });
     if (sub.estado!=='pendiente')
       return res.status(422).json({ ok: false, error: { code: 'INVALID_STATE' } });
+
     await client.query('BEGIN');
+
+    // ── Grupal: reward ALL group members ──────────────────────
+    if (sub.tipo === 'grupal') {
+      const { rows: grpRows } = await client.query(
+        "SELECT id FROM mission_groups WHERE submission_id=$1", [req.params.id]
+      );
+      if (grpRows.length) {
+        const groupId = grpRows[0].id;
+        const { rows: members } = await client.query(
+          'SELECT user_id FROM mission_group_members WHERE group_id=$1', [groupId]
+        );
+        let firstTxId = null;
+        for (const m of members) {
+          const txId = await ledger.reward({
+            teacherId: req.user.id, studentId: m.user_id,
+            amount: sub.recompensa, description: `Mision grupal completada: ${sub.titulo}`,
+            meta: { referenceId: sub.mission_id, referenceType: 'mission', group_id: groupId },
+          });
+          if (!firstTxId) firstTxId = txId;
+          await saveNotif(client, m.user_id, 'mission_approved',
+            `Mision grupal aprobada: ${sub.titulo}`, feedback||`Recibiste ${sub.recompensa} monedas`,
+            { recompensa: sub.recompensa, feedback }
+          );
+          notify(m.user_id, { type:'mission_approved', mision:sub.titulo, amount:sub.recompensa, feedback });
+
+          // If requires peer eval, notify each member to evaluate
+          if (sub.requires_peer_eval) {
+            notify(m.user_id, {
+              type: 'peer_eval_pending',
+              group_id: groupId,
+              mission_id: sub.mission_id,
+              message: `Evaluá la cooperacion de tu equipo en "${sub.titulo}"`,
+            });
+          }
+        }
+        await client.query("UPDATE mission_groups SET status='approved' WHERE id=$1", [groupId]);
+        await client.query(
+          "UPDATE mission_submissions SET estado='aprobada',reviewed_at=NOW(),reviewed_by=$1,transaction_id=$2,feedback=$3 WHERE id=$4",
+          [req.user.id, firstTxId, feedback||null, req.params.id]
+        );
+        await client.query('COMMIT');
+        return res.json({ ok: true, data: { message: 'Aprobada (grupo)', members_rewarded: members.length, transaction_id: firstTxId } });
+      }
+    }
+
+    // ── Individual mission ────────────────────────────────────
     const txId = await ledger.reward({
       teacherId: req.user.id, studentId: sub.student_id,
       amount: sub.recompensa, description: `Mision completada: ${sub.titulo}`,
