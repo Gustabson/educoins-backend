@@ -179,6 +179,18 @@ router.patch('/:id', auth, roles('teacher','admin'), async (req, res) => {
 router.delete('/:id', auth, roles('teacher','admin'), async (req, res) => {
   try {
     const isAdmin = req.user.rol === 'admin';
+    // If mission has submissions, soft-delete (deactivate) to preserve referential integrity
+    const { rows: subCheck } = await db.query(
+      'SELECT id FROM mission_submissions WHERE mission_id=$1 LIMIT 1', [req.params.id]
+    );
+    if (subCheck.length) {
+      const { rows } = await db.query(
+        'UPDATE missions SET activa=FALSE WHERE id=$1 AND (created_by=$2 OR $3) RETURNING id',
+        [req.params.id, req.user.id, isAdmin]
+      );
+      if (!rows.length) return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND' } });
+      return res.json({ ok: true, data: { id: rows[0].id, soft: true } });
+    }
     const { rows } = await db.query(
       'DELETE FROM missions WHERE id=$1 AND (created_by=$2 OR $3) RETURNING id',
       [req.params.id, req.user.id, isAdmin]

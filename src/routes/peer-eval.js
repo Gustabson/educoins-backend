@@ -164,7 +164,8 @@ router.get('/classmates', auth, async (req, res) => {
     if (!mission_id) return res.status(400).json({ ok: false, error: { code: 'MISSING_MISSION_ID' } });
 
     // Get classmates minus those already in a non-rejected group for this mission
-    const { rows } = await db.query(`
+    // Try classroom-based first; fall back to all active students in the school
+    let { rows } = await db.query(`
       SELECT u.id, u.nombre, u.skin, u.border, u.avatar_bg, u.foto_url
       FROM classroom_members cm
       JOIN users u ON u.id = cm.user_id
@@ -181,6 +182,24 @@ router.get('/classmates', auth, async (req, res) => {
       )
       ORDER BY u.nombre
     `, [req.user.id, mission_id]);
+
+    // Fallback: if no classmates found (no classroom assigned), show all active students
+    if (!rows.length) {
+      const { rows: fallback } = await db.query(`
+        SELECT u.id, u.nombre, u.skin, u.border, u.avatar_bg, u.foto_url
+        FROM users u
+        WHERE u.id != $1
+        AND u.rol = 'student'
+        AND u.activo = TRUE
+        AND u.id NOT IN (
+          SELECT mgm.user_id FROM mission_group_members mgm
+          JOIN mission_groups mg ON mg.id = mgm.group_id
+          WHERE mg.mission_id = $2 AND mg.status NOT IN ('rejected')
+        )
+        ORDER BY u.nombre
+      `, [req.user.id, mission_id]);
+      rows = fallback;
+    }
 
     // Check rotation: how many times paired with each in last N grupal missions
     const cfg = await getPeerEvalConfig();
