@@ -174,7 +174,7 @@ router.get('/classmates', auth, async (req, res) => {
       )
       AND u.id != $1
       AND u.rol = 'student'
-      AND u.activo = TRUE
+      AND (u.activo IS NULL OR u.activo = TRUE)
       AND u.id NOT IN (
         SELECT mgm.user_id FROM mission_group_members mgm
         JOIN mission_groups mg ON mg.id = mgm.group_id
@@ -190,7 +190,7 @@ router.get('/classmates', auth, async (req, res) => {
         FROM users u
         WHERE u.id != $1
         AND u.rol = 'student'
-        AND u.activo = TRUE
+        AND (u.activo IS NULL OR u.activo = TRUE)
         AND u.id NOT IN (
           SELECT mgm.user_id FROM mission_group_members mgm
           JOIN mission_groups mg ON mg.id = mgm.group_id

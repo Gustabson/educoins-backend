@@ -75,11 +75,36 @@ router.get('/', auth, async (req, res) => {
   }
 });
 
+// GET /missions/my-classrooms — teacher's classrooms with stats
+router.get('/my-classrooms', auth, roles('teacher','admin'), async (req, res) => {
+  try {
+    const isAdmin = req.user.rol === 'admin';
+    const { rows } = await db.query(`
+      SELECT c.id, c.nombre, c.descripcion,
+        (SELECT COUNT(*)::int FROM classroom_members cm2 WHERE cm2.classroom_id=c.id AND cm2.rol='student') AS student_count,
+        (SELECT COUNT(*)::int FROM missions m WHERE m.classroom_id=c.id AND m.activa=TRUE) AS mission_count,
+        (SELECT COUNT(*)::int FROM missions m
+          JOIN mission_submissions ms ON ms.mission_id=m.id
+          WHERE m.classroom_id=c.id AND ms.estado='pendiente') AS pending_count
+      FROM classrooms c
+      ${isAdmin ? '' : `
+        JOIN classroom_members cm ON cm.classroom_id=c.id AND cm.user_id=$1 AND cm.rol='teacher'
+      `}
+      WHERE c.activa=TRUE
+      ORDER BY c.nombre
+    `, isAdmin ? [] : [req.user.id]);
+    res.json({ ok: true, data: rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
 // GET /missions/teacher
 router.get('/teacher', auth, roles('teacher','admin'), async (req, res) => {
   try {
     const isAdmin = req.user.rol === 'admin';
-    const { rows } = await db.query(`
+    const { classroom_id } = req.query;
+    let query = `
       SELECT m.*, u.nombre AS creador_nombre, u.rol AS creador_rol,
         (SELECT COUNT(*) FROM mission_submissions ms WHERE ms.mission_id=m.id AND ms.estado='pendiente')::int AS pendientes,
         (SELECT COUNT(*) FROM mission_submissions ms WHERE ms.mission_id=m.id AND ms.estado='aprobada')::int  AS aprobadas,
@@ -87,9 +112,37 @@ router.get('/teacher', auth, roles('teacher','admin'), async (req, res) => {
       FROM missions m
       JOIN users u ON u.id = m.created_by
       WHERE ($1 OR m.created_by=$2)
-      ORDER BY m.created_at DESC
-    `, [isAdmin, req.user.id]);
+    `;
+    const params = [isAdmin, req.user.id];
+    if (classroom_id) {
+      params.push(classroom_id);
+      query += ` AND m.classroom_id = $${params.length}`;
+    }
+    query += ' ORDER BY m.created_at DESC';
+    const { rows } = await db.query(query, params);
     res.json({ ok: true, data: rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// POST /missions/:id/duplicate — duplicate a mission to another classroom
+router.post('/:id/duplicate', auth, roles('teacher','admin'), async (req, res) => {
+  try {
+    const { classroom_id } = req.body;
+    const { rows: src } = await db.query('SELECT * FROM missions WHERE id=$1', [req.params.id]);
+    if (!src.length) return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND' } });
+    const m = src[0];
+    const { rows } = await db.query(`
+      INSERT INTO missions (id,titulo,descripcion,recompensa,dificultad,tipo,created_by,
+        max_submissions,classroom_id,imagen_url,icon,auto_approve,reward_type,reward_extra,fecha_inicio,
+        grupo_min_size,grupo_max_size,requires_peer_eval)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING *
+    `, [uuidv4(), m.titulo, m.descripcion, m.recompensa, m.dificultad, m.tipo, req.user.id,
+        m.max_submissions, classroom_id || null, m.imagen_url, m.icon, m.auto_approve,
+        m.reward_type, m.reward_extra ? JSON.stringify(m.reward_extra) : null, null,
+        m.grupo_min_size, m.grupo_max_size, m.requires_peer_eval]);
+    res.status(201).json({ ok: true, data: rows[0] });
   } catch (err) {
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }
