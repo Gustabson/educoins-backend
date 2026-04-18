@@ -163,8 +163,17 @@ router.get('/classmates', auth, async (req, res) => {
     const { mission_id } = req.query;
     if (!mission_id) return res.status(400).json({ ok: false, error: { code: 'MISSING_MISSION_ID' } });
 
-    // Get classmates minus those already in a non-rejected group for this mission
-    // Try classroom-based first; fall back to all active students in the school
+    // Helper: IDs already in a non-rejected group for this mission (only fully accepted groups)
+    const { rows: busyRows } = await db.query(`
+      SELECT DISTINCT mgm.user_id
+      FROM mission_group_members mgm
+      JOIN mission_groups mg ON mg.id = mgm.group_id
+      WHERE mg.mission_id = $1
+        AND mg.status IN ('ready','submitted','approved')
+    `, [mission_id]);
+    const busyIds = busyRows.map(r => r.user_id);
+
+    // Try classroom-based first
     let { rows } = await db.query(`
       SELECT u.id, u.nombre, u.skin, u.border, u.avatar_bg, u.foto_url
       FROM classroom_members cm
@@ -174,31 +183,24 @@ router.get('/classmates', auth, async (req, res) => {
       )
       AND u.id != $1
       AND u.rol = 'student'
-      AND (u.activo IS NULL OR u.activo = TRUE)
-      AND u.id NOT IN (
-        SELECT mgm.user_id FROM mission_group_members mgm
-        JOIN mission_groups mg ON mg.id = mgm.group_id
-        WHERE mg.mission_id = $2 AND mg.status NOT IN ('rejected')
-      )
       ORDER BY u.nombre
-    `, [req.user.id, mission_id]);
+    `, [req.user.id]);
 
-    // Fallback: if no classmates found (no classroom assigned), show all active students
+    // Fallback: show ALL students in the school (no classroom filter, no activo filter)
     if (!rows.length) {
       const { rows: fallback } = await db.query(`
         SELECT u.id, u.nombre, u.skin, u.border, u.avatar_bg, u.foto_url
         FROM users u
         WHERE u.id != $1
         AND u.rol = 'student'
-        AND (u.activo IS NULL OR u.activo = TRUE)
-        AND u.id NOT IN (
-          SELECT mgm.user_id FROM mission_group_members mgm
-          JOIN mission_groups mg ON mg.id = mgm.group_id
-          WHERE mg.mission_id = $2 AND mg.status NOT IN ('rejected')
-        )
         ORDER BY u.nombre
-      `, [req.user.id, mission_id]);
+      `, [req.user.id]);
       rows = fallback;
+    }
+
+    // Remove students already in a completed/active group for this mission
+    if (busyIds.length) {
+      rows = rows.filter(u => !busyIds.includes(u.id));
     }
 
     // Check rotation: how many times paired with each in last N grupal missions
