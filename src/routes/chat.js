@@ -318,7 +318,9 @@ router.get('/friends', auth, async (req, res) => {
 router.get('/users/search', auth, async (req, res) => {
   try {
     const q = (req.query.q || '').trim();
-    if (q.length < 2) {
+    // Vacío devuelve sugerencias para que "Agregar" sea descubrible; una sola
+    // letra todavía es demasiado amplia y espera más entrada del usuario.
+    if (q.length === 1) {
       return res.json({ ok: true, data: [] });
     }
 
