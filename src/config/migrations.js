@@ -9,6 +9,23 @@ async function runCoreMigrations() {
     await client.query("SELECT pg_advisory_xact_lock(hashtext('educoins-core-migrations-v1'))");
     await ensureApplicationSchema(client);
 
+    // Migración temporal solicitada: crear una cuenta de alumno accesible.
+    const { rows: demoStudentRows } = await client.query(`
+      INSERT INTO users (id, email, password_hash, nombre, rol, activo)
+      VALUES ($1, 'alumno@educoins.demo', $2, 'Alumno Demo', 'student', TRUE)
+      ON CONFLICT (email) DO UPDATE
+        SET password_hash=EXCLUDED.password_hash,
+            nombre=EXCLUDED.nombre,
+            rol='student',
+            activo=TRUE
+      RETURNING id
+    `, [uuidv4(), '$2a$12$Y3waxs/M2rlLeIyxdQ5CHO4nZT8VCYrM1PBADduqv1/vwWJdQ01RC']);
+    await client.query(`
+      INSERT INTO accounts (id, user_id, account_type, label)
+      SELECT $1, $2, 'student', 'Cuenta de Alumno Demo'
+      WHERE NOT EXISTS (SELECT 1 FROM accounts WHERE user_id=$2)
+    `, [uuidv4(), demoStudentRows[0].id]);
+
     await client.query(`
       ALTER TABLE users DROP CONSTRAINT IF EXISTS users_rol_check;
       -- Normalizar instalaciones antiguas que guardaban los roles en español.
