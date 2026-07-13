@@ -273,7 +273,9 @@ async function runCoreMigrations() {
         CHECK (status IN ('pending_payment','payment_sent','disputed','completed','refunded','expired'));
     `);
 
-    await client.query(`INSERT INTO p2p_config (id) VALUES (1) ON CONFLICT (id) DO NOTHING`);
+    // Instalaciones antiguas crearon este singleton con UUID; las nuevas usan
+    // SMALLINT. DEFAULT VALUES respeta ambos esquemas sin convertir ni borrar.
+    await client.query(`INSERT INTO p2p_config DEFAULT VALUES ON CONFLICT DO NOTHING`);
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS tax_schedules (
