@@ -4,23 +4,18 @@
 // por cada request — es más eficiente y rápido.
 
 const { Pool } = require('pg');
-const { DATABASE_URL, NODE_ENV } = require('./env');
+const { DATABASE_URL, NODE_ENV, DB_SSL } = require('./env');
+
+let databaseHost = '';
+try { databaseHost = new URL(DATABASE_URL).hostname; } catch { /* Pool reportará la URL inválida */ }
+const isLocalDatabase = ['localhost', '127.0.0.1', '::1'].includes(databaseHost);
+const useSsl = DB_SSL === 'true' ||
+  (DB_SSL === 'auto' && NODE_ENV === 'production' && !isLocalDatabase);
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
   // En producción, PostgreSQL puede requerir SSL
-  ssl: NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-});
-
-// Verificar conexión al arrancar
-pool.connect((err, client, release) => {
-  if (err) {
-    console.error('❌ Error conectando a PostgreSQL:', err.message);
-    console.error('   Verificá que PostgreSQL esté corriendo y que DATABASE_URL sea correcta.');
-    process.exit(1);
-  }
-  release();
-  console.log('✅ Conectado a PostgreSQL');
+  ssl: useSsl ? { rejectUnauthorized: false } : false,
 });
 
 // Función helper para ejecutar queries
@@ -35,6 +30,7 @@ const db = {
   //      await client.query('COMMIT')
   //      client.release()
   getClient: () => pool.connect(),
+  close: () => pool.end(),
 };
 
 module.exports = db;

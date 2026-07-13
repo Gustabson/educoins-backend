@@ -4,11 +4,14 @@
 // Los alumnos pueden ver y marcar como leídos los propios.
 
 const express  = require('express');
-const { v4: uuidv4 } = require('uuid');
+const { v4: uuidv4, validate: isUuid } = require('uuid');
 const db       = require('../config/db');
 const auth     = require('../middleware/auth');
 const roles    = require('../middleware/roles');
+const uuidParams = require('../middleware/uuid-params');
+const { assertSufficientBalance, lockAccountsForUpdate } = require('../services/balance');
 const router   = express.Router();
+uuidParams(router, 'id');
 
 // ── Startup migration ─────────────────────────────────────────
 db.query(`
@@ -34,11 +37,17 @@ router.post('/', auth, roles('admin'), async (req, res) => {
   const client = await db.getClient();
   try {
     const { to_user_ids, mensaje, severity = 'advertencia', coins_penalty = 0, coins_reward = 0 } = req.body;
-    if (!to_user_ids?.length || !mensaje?.trim()) {
+    const userIds = Array.isArray(to_user_ids) ? [...new Set(to_user_ids.filter(isUuid))].slice(0, 500) : [];
+    if (!userIds.length || typeof mensaje !== 'string' || !mensaje.trim() || mensaje.trim().length > 2000 ||
+        !['advertencia','sancion','grave','absolucion','reconocimiento'].includes(severity)) {
       return res.status(400).json({ ok: false, error: { code: 'MISSING_FIELDS', message: 'Destinatarios y mensaje son requeridos' } });
     }
-    const penalty = Math.max(0, parseInt(coins_penalty) || 0);
-    const reward  = Math.max(0, parseInt(coins_reward)  || 0);
+    const penalty = Number(coins_penalty);
+    const reward  = Number(coins_reward);
+    if (!Number.isSafeInteger(penalty) || penalty < 0 || penalty > 1000000 ||
+        !Number.isSafeInteger(reward) || reward < 0 || reward > 1000000) {
+      return res.status(400).json({ ok:false, error:{code:'INVALID_AMOUNT'} });
+    }
 
     // Obtain treasury once if there are economic effects
     let treasuryId = null;
@@ -53,7 +62,7 @@ router.post('/', auth, roles('admin'), async (req, res) => {
     const io = getIO();
     const results = [];
 
-    for (const userId of to_user_ids) {
+    for (const userId of userIds) {
       await client.query('BEGIN');
       try {
         const { rows } = await client.query(`
@@ -69,6 +78,12 @@ router.post('/', auth, roles('admin'), async (req, res) => {
           [userId]
         );
         const userAccId = accRows[0]?.id;
+        if ((penalty > 0 || reward > 0) && (!treasuryId || !userAccId)) {
+          throw new Error('Cuenta económica no encontrada');
+        }
+        if (treasuryId && userAccId) {
+          await lockAccountsForUpdate([treasuryId, userAccId], client);
+        }
 
         // Penalización: alumno → treasury
         if (penalty > 0 && treasuryId && userAccId) {
@@ -100,6 +115,7 @@ router.post('/', auth, roles('admin'), async (req, res) => {
 
         // Recompensa: treasury → alumno
         if (reward > 0 && treasuryId && userAccId) {
+          await assertSufficientBalance(treasuryId, reward, client);
           const txId = uuidv4();
           await client.query(
             `INSERT INTO transactions (id, type, description, initiated_by, metadata)

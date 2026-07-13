@@ -72,7 +72,7 @@ CREATE INDEX IF NOT EXISTS idx_reports_reporter  ON reports(reporter_id);
 
 INSERT INTO posts (titulo, cuerpo, autor_id, tag)
 SELECT
-  'Bienvenidos al nuevo sistema Aubank',
+  'Bienvenidos al nuevo sistema EduCoins',
   'A partir de hoy el sistema de economía escolar digital está disponible para todos los alumnos. Podés ganar monedas completando misiones, canjear premios en la tienda y mucho más.',
   (SELECT id FROM users WHERE rol = 'admin' LIMIT 1),
   'Aviso'

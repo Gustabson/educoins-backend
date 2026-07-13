@@ -1,13 +1,15 @@
 // src/routes/admin.js
 const express = require('express');
 const bcrypt  = require('bcryptjs');
-const { v4: uuidv4 } = require('uuid');
+const { v4: uuidv4, validate: isUuid } = require('uuid');
 const db     = require('../config/db');
 const auth   = require('../middleware/auth');
 const roles  = require('../middleware/roles');
+const uuidParams = require('../middleware/uuid-params');
 const ledger = require('../services/ledger');
 const { getBalance } = require('../services/balance');
 const router = express.Router();
+uuidParams(router, 'id');
 
 // Todos los endpoints de admin requieren autenticación y rol admin
 router.use(auth, roles('admin'));
@@ -61,6 +63,14 @@ router.post('/users', async (req, res) => {
     if (!nombre || !email || !password || !rol) {
       return res.status(400).json({ ok: false, error: { code: 'MISSING_FIELDS', message: 'Todos los campos son requeridos' } });
     }
+    if (typeof nombre !== 'string' || nombre.trim().length < 2 || nombre.trim().length > 120 ||
+        typeof email !== 'string' || email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()) ||
+        typeof password !== 'string' || password.length < 8 || password.length > 200) {
+      return res.status(400).json({
+        ok: false,
+        error: { code: 'INVALID_FIELDS', message: 'Revisá nombre, email y contraseña (mínimo 8 caracteres)' }
+      });
+    }
 
     const validRoles = ['student','teacher','parent','staff','admin'];
     if (!validRoles.includes(rol)) {
@@ -77,7 +87,7 @@ router.post('/users', async (req, res) => {
     const { rows } = await client.query(
       `INSERT INTO users (id, nombre, email, password_hash, rol, permisos)
        VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, nombre, email, rol, permisos`,
-      [userId, nombre, email.toLowerCase().trim(), password_hash, rol, permisosFinal]
+      [userId, nombre.trim(), email.toLowerCase().trim(), password_hash, rol, permisosFinal]
     );
 
     // Crear cuenta automáticamente para el usuario
@@ -105,25 +115,45 @@ router.post('/users', async (req, res) => {
 
 // ── PATCH /api/v1/admin/users/:id/deactivate ─────────────────
 router.patch('/users/:id/deactivate', async (req, res) => {
+  const client = await db.getClient();
   try {
-    await db.query('UPDATE users SET activo=false WHERE id=$1', [req.params.id]);
+    if (req.params.id === req.user.id) {
+      return res.status(400).json({ ok: false, error: { code: 'SELF_DEACTIVATION', message: 'No podés desactivar tu propia cuenta' } });
+    }
+    await client.query('BEGIN');
+    await client.query("SELECT pg_advisory_xact_lock(hashtext('active-admin-guard'))");
+    const { rows } = await client.query('SELECT rol, activo FROM users WHERE id=$1 FOR UPDATE', [req.params.id]);
+    if (!rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND', message: 'Usuario no encontrado' } });
+    }
+    if (rows[0].rol === 'admin' && rows[0].activo) {
+      const { rows: count } = await client.query("SELECT COUNT(*)::int AS total FROM users WHERE rol='admin' AND activo=TRUE");
+      if (count[0].total <= 1) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ ok: false, error: { code: 'LAST_ADMIN', message: 'No se puede desactivar al último administrador activo' } });
+      }
+    }
+    await client.query('UPDATE users SET activo=false WHERE id=$1', [req.params.id]);
+    await client.query('COMMIT');
     res.json({ ok: true, data: { message: 'Usuario desactivado' } });
   } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
-  }
+  } finally { client.release(); }
 });
 
 // ── POST /api/v1/admin/mint ───────────────────────────────────
 router.post('/mint', async (req, res) => {
   try {
     const { amount, description } = req.body;
-    if (!amount || !description) {
+    if (!amount || typeof description !== 'string' || description.trim().length < 3 || description.trim().length > 500) {
       return res.status(400).json({ ok: false, error: { code: 'MISSING_FIELDS', message: 'Monto y descripción requeridos' } });
     }
-    if (!Number.isInteger(amount) || amount <= 0) {
+    if (!Number.isSafeInteger(amount) || amount <= 0 || amount > 1000000) {
       return res.status(400).json({ ok: false, error: { code: 'INVALID_AMOUNT', message: 'El monto debe ser un entero positivo' } });
     }
-    const txId = await ledger.mint({ adminId: req.user.id, amount, description });
+    const txId = await ledger.mint({ adminId: req.user.id, amount, description:description.trim() });
     res.json({ ok: true, data: { transaction_id: txId, message: `${amount} monedas acreditadas a la Tesorería` } });
   } catch (err) {
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
@@ -134,7 +164,7 @@ router.post('/mint', async (req, res) => {
 router.post('/burn', async (req, res) => {
   try {
     const { amount, reason } = req.body;
-    if (!amount || !reason) {
+    if (!Number.isSafeInteger(amount) || amount <= 0 || amount > 1000000 || typeof reason !== 'string' || reason.trim().length < 5 || reason.trim().length > 500) {
       return res.status(400).json({ ok: false, error: { code: 'MISSING_FIELDS', message: 'Monto y motivo son requeridos' } });
     }
     const txId = await ledger.burn({ adminId: req.user.id, amount, reason });
@@ -351,13 +381,19 @@ router.post('/bank-transfer', auth, roles('admin'), async (req, res) => {
   const client = await db.getClient();
   try {
     const { recipients, classroom_id, amount, descripcion, tipo='premio' } = req.body;
-    if (!recipients || !amount || amount <= 0)
-      return res.status(400).json({ ok: false, error: { code: 'MISSING_FIELDS' } });
+    const rewardAmount = Number(amount);
+    if (!recipients || !Number.isSafeInteger(rewardAmount) || rewardAmount <= 0 || rewardAmount > 1000000 ||
+        (descripcion != null && (typeof descripcion !== 'string' || descripcion.trim().length > 500))) {
+      return res.status(400).json({ ok: false, error: { code: 'INVALID_TRANSFER', message: 'Revisá los destinatarios, el monto y la descripción' } });
+    }
 
     // Resolver lista de destinatarios
     let userIds = [];
     if (Array.isArray(recipients)) {
-      userIds = recipients;
+      if (!recipients.length || recipients.length > 500 || recipients.some(id => !isUuid(id))) {
+        return res.status(400).json({ ok: false, error: { code: 'INVALID_RECIPIENTS', message: 'La lista de destinatarios es inválida' } });
+      }
+      userIds = [...new Set(recipients)];
     } else if (recipients === 'all') {
       const { rows } = await client.query("SELECT id FROM users WHERE activo=TRUE AND rol!='admin'");
       userIds = rows.map(r => r.id);
@@ -384,15 +420,15 @@ router.post('/bank-transfer', auth, roles('admin'), async (req, res) => {
       try {
         const txId = await ledger.reward({
           teacherId: req.user.id, studentId: uid,
-          amount: parseInt(amount),
-          description: descripcion || `${tipo} del Banco Aubank`,
+          amount: rewardAmount,
+          description: descripcion || `${tipo} del Banco EduCoins`,
         });
         // Guardar en audit_log
         await db.query(`
           INSERT INTO audit_log (actor_id, action, target_type, target_id, details)
           VALUES ($1,'reward','user',$2,$3)
         `, [req.user.id, uid, JSON.stringify({
-          amount: parseInt(amount), tipo, descripcion,
+          amount: rewardAmount, tipo, descripcion,
           transaction_id: txId, banco: true,
         })]);
         // Guardar notificación persistente en DB
@@ -400,9 +436,9 @@ router.post('/bank-transfer', auth, roles('admin'), async (req, res) => {
           INSERT INTO notifications (user_id, tipo, titulo, cuerpo, data)
           VALUES ($1, 'reward', $2, $3, $4)
         `, [uid,
-          `Recibiste 🪙${parseInt(amount)} del Banco`,
-          descripcion || `${tipo} — Banco Aubank`,
-          JSON.stringify({ amount: parseInt(amount), tipo, transaction_id: txId })
+          `Recibiste 🪙${rewardAmount} del Banco`,
+          descripcion || `${tipo} — Banco EduCoins`,
+          JSON.stringify({ amount: rewardAmount, tipo, transaction_id: txId })
         ]);
         results.push({ user_id: uid, tx_id: txId, ok: true });
       } catch(e) {
@@ -425,6 +461,11 @@ router.post('/bank-revert', auth, roles('admin'), async (req, res) => {
     const { transaction_id, motivo } = req.body;
     if (!transaction_id || !motivo)
       return res.status(400).json({ ok: false, error: { code: 'MISSING_FIELDS' } });
+    if (typeof motivo !== 'string' || motivo.trim().length < 3 || motivo.trim().length > 300)
+      return res.status(400).json({ ok:false, error:{code:'INVALID_REASON'} });
+
+    await client.query('BEGIN');
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [String(transaction_id)]);
 
     // Buscar la transacción original
     const { rows: txRows } = await client.query(`
@@ -436,23 +477,28 @@ router.post('/bank-revert', auth, roles('admin'), async (req, res) => {
       JOIN accounts a ON a.id=le.account_id
       LEFT JOIN users u ON u.id=a.user_id
       WHERE t.id=$1 AND t.type='reward'
+        AND NOT EXISTS (
+          SELECT 1 FROM transactions r
+           WHERE r.reference_id=t.id AND r.reference_type='revert'
+        )
+      FOR UPDATE OF t
     `, [transaction_id]);
 
-    if (!txRows.length)
+    if (!txRows.length) {
+      await client.query('ROLLBACK');
       return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND', message: 'Transaccion no encontrada o no reversible' } });
+    }
 
     const tx = txRows[0];
-    const ledger = require('../services/ledger');
-
     // Revertir: tomar el monto del usuario y devolverlo al tesoro
     // Usamos un adjustment
-    await client.query('BEGIN');
-    const { getTreasuryAccountId, getAccountByUserId, assertSufficientBalance } = require('../services/balance');
+    const { getTreasuryAccountId, getAccountByUserId, assertSufficientBalance, lockAccountsForUpdate } = require('../services/balance');
     const { v4: uuidv4 } = require('uuid');
 
     const treasuryId = await getTreasuryAccountId(client);
     const userAccId  = await getAccountByUserId(tx.user_id, client);
-    await assertSufficientBalance(userAccId, tx.entry_amount, client);
+    await lockAccountsForUpdate([userAccId, treasuryId], client);
+    await assertSufficientBalance(userAccId, Number(tx.entry_amount), client);
 
     const revertId = uuidv4();
     await client.query(`
@@ -489,12 +535,23 @@ router.post('/tax', auth, roles('admin'), async (req, res) => {
   const client = await db.getClient();
   try {
     const { recipients, classroom_id, amount, motivo, periodicidad='unico', dias } = req.body;
-    if (!recipients || !amount || amount <= 0 || !motivo)
+    const taxAmount = Number(amount);
+    if (!recipients || !Number.isSafeInteger(taxAmount) || taxAmount <= 0 || taxAmount > 1000000 ||
+        typeof motivo !== 'string' || motivo.trim().length < 3 || motivo.trim().length > 300 ||
+        !['unico','diario'].includes(periodicidad) ||
+        (periodicidad === 'diario' && (!Number.isSafeInteger(Number(dias)) || Number(dias) < 1 || Number(dias) > 365)))
       return res.status(400).json({ ok: false, error: { code: 'MISSING_FIELDS' } });
 
     let userIds = [];
     if (Array.isArray(recipients)) {
-      userIds = recipients;
+      const ids = [...new Set(recipients.filter(isUuid))].slice(0, 500);
+      if (ids.length) {
+        const { rows } = await client.query(
+          "SELECT id FROM users WHERE id=ANY($1::uuid[]) AND activo=TRUE AND rol='student'",
+          [ids]
+        );
+        userIds = rows.map(row => row.id);
+      }
     } else if (recipients === 'all') {
       const { rows } = await client.query("SELECT id FROM users WHERE activo=TRUE AND rol='student'");
       userIds = rows.map(r => r.id);
@@ -507,7 +564,7 @@ router.post('/tax', auth, roles('admin'), async (req, res) => {
     if (!userIds.length)
       return res.status(400).json({ ok: false, error: { code: 'NO_RECIPIENTS' } });
 
-    const { getTreasuryAccountId, getAccountByUserId } = require('../services/balance');
+    const { getTreasuryAccountId, getAccountByUserId, lockAccountsForUpdate } = require('../services/balance');
     const { v4: uuidv4 } = require('uuid');
     const io = require('../socket').getIO?.();
     const results = [];
@@ -517,11 +574,12 @@ router.post('/tax', auth, roles('admin'), async (req, res) => {
       try {
         await client.query('BEGIN');
         const userAccId = await getAccountByUserId(uid, client);
+        await lockAccountsForUpdate([userAccId, treasuryId], client);
         // Calcular saldo actual
         const { rows: balRows } = await client.query(
           'SELECT COALESCE(SUM(amount),0)::int AS bal FROM ledger_entries WHERE account_id=$1', [userAccId]);
         const saldo = balRows[0].bal;
-        const cobrar = Math.min(parseInt(amount), saldo); // no cobrar más de lo que tiene
+        const cobrar = Math.min(taxAmount, saldo); // no cobrar más de lo que tiene
 
         if (cobrar > 0) {
           const txId = uuidv4();
@@ -539,12 +597,21 @@ router.post('/tax', auth, roles('admin'), async (req, res) => {
              JSON.stringify({ amount: cobrar, motivo, periodicidad })]);
         }
 
+        if (periodicidad === 'diario' && Number(dias) > 1) {
+          await client.query(
+            `INSERT INTO tax_schedules
+               (user_id,amount,reason,remaining_charges,next_charge,created_by)
+             VALUES ($1,$2,$3,$4,NOW()+INTERVAL '1 day',$5)`,
+            [uid, taxAmount, motivo.trim(), Number(dias)-1, req.user.id]
+          );
+        }
+
         await client.query('COMMIT');
 
         if (io) io.to(`user:${uid}`).emit('notification', {
           type: 'tax', amount: cobrar, motivo, periodicidad,
         });
-        results.push({ user_id: uid, cobrado: cobrar, ok: true });
+        results.push({ user_id: uid, cobrado: cobrar, programado: periodicidad === 'diario' ? Number(dias)-1 : 0, ok: true });
       } catch(e) {
         await client.query('ROLLBACK').catch(()=>{});
         results.push({ user_id: uid, ok: false, error: e.message });

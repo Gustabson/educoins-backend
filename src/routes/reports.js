@@ -13,6 +13,8 @@ const router  = express.Router();
 const db      = require('../config/db');
 const auth    = require('../middleware/auth');
 const roles   = require('../middleware/roles');
+const uuidParams = require('../middleware/uuid-params');
+uuidParams(router, 'id');
 
 // Todos los tipos válidos (sincronizado con constants.js del frontend)
 const TIPOS_VALIDOS = [
@@ -43,8 +45,7 @@ function staffHasAccess(user, reportRow) {
   const userPerms = user.permisos || [];
   if (userPerms.includes('*')) return true;
   const shared = reportRow.compartido_con || [];
-  return shared.some(d => userPerms.includes(d)) ||
-         (user.rol === 'teacher' && shared.includes('psicologia'));
+  return shared.some(d => userPerms.includes(d));
 }
 
 // ── POST /reports ─────────────────────────────────────────────
@@ -126,13 +127,10 @@ router.get('/', auth, async (req, res) => {
     // Construir filtro de acceso para staff
     const userPerms = u.permisos || [];
     const isSuperAdmin = isAdmin || userPerms.includes('*');
-    // si es teacher backward-compat, tiene acceso psicologia
-    const effectivePerms = (u.rol === 'teacher' && !userPerms.includes('psicologia'))
-      ? [...userPerms, 'psicologia']
-      : userPerms;
+    const effectivePerms = userPerms;
 
     const staffFilter = (!isSuperAdmin && isStaff)
-      ? `AND r.compartido_con && $7::text[]`
+      ? `AND r.compartido_con && $6::text[]`
       : '';
 
     const { rows } = await db.query(`
@@ -159,7 +157,7 @@ router.get('/', auth, async (req, res) => {
       LIMIT $4 OFFSET $5
     `, isSuperAdmin
       ? [estado, tipo, grupo, limit, offset]
-      : [estado, tipo, grupo, limit, offset, null, effectivePerms]
+      : [estado, tipo, grupo, limit, offset, effectivePerms]
     );
 
     const { rows: countRows } = await db.query(`
@@ -167,10 +165,10 @@ router.get('/', auth, async (req, res) => {
       WHERE ($1::text IS NULL OR r.estado = $1)
         AND ($2::text IS NULL OR r.tipo   = $2)
         AND ($3::text IS NULL OR r.grupo  = $3)
-        ${staffFilter}
+        ${!isSuperAdmin && isStaff ? `AND r.compartido_con && $4::text[]` : ''}
     `, isSuperAdmin
       ? [estado, tipo, grupo]
-      : [estado, tipo, grupo, null, null, null, effectivePerms]
+      : [estado, tipo, grupo, effectivePerms]
     );
 
     const { rows: summary } = await db.query(`

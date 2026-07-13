@@ -1,5 +1,6 @@
 // src/socket.js
 const jwt = require('jsonwebtoken');
+const { validate: isUuid } = require('uuid');
 const { JWT_SECRET } = require('./config/env');
 const db = require('./config/db');
 
@@ -10,6 +11,54 @@ const db = require('./config/db');
 let _io = null;
 function getIO() { return _io; }
 
+function conversationRoom(conversation, conversationId) {
+  if (conversation.type === 'global') return 'global';
+  if (conversation.type === 'classroom' && conversation.classroom_id) return `classroom:${conversation.classroom_id}`;
+  if (conversation.type === 'personal') return `personal:${conversationId}`;
+  if (conversation.type === 'group') return `group:${conversationId}`;
+  if (conversation.type === 'global_parents') return 'parents:global';
+  if (conversation.type === 'classroom_parents' && conversation.classroom_id) return `parents:classroom:${conversation.classroom_id}`;
+  return null;
+}
+
+async function canUseConversation(user, conversation, conversationId) {
+  if (conversation.type === 'global_parents') return user.rol === 'parent';
+  if (conversation.type === 'classroom_parents') {
+    if (user.rol !== 'parent' || !conversation.classroom_id) return false;
+    const { rowCount } = await db.query(`
+      SELECT 1
+        FROM parent_student_links psl
+        JOIN classroom_members cm ON cm.user_id=psl.student_id AND cm.rol='student'
+       WHERE psl.parent_id=$1 AND cm.classroom_id=$2
+       LIMIT 1`, [user.id, conversation.classroom_id]);
+    return rowCount > 0;
+  }
+  if (conversation.type === 'classroom') {
+    const { rowCount } = await db.query(
+      'SELECT 1 FROM classroom_members WHERE classroom_id=$1 AND user_id=$2',
+      [conversation.classroom_id, user.id]
+    );
+    return rowCount > 0;
+  }
+  if (conversation.type === 'personal') {
+    const { rowCount } = await db.query(`
+      SELECT 1
+        FROM conversation_members mine
+        JOIN conversation_members other_member
+          ON other_member.conversation_id=mine.conversation_id
+         AND other_member.user_id<>mine.user_id
+        JOIN friendships friendship
+          ON ((friendship.requester_id=mine.user_id AND friendship.addressee_id=other_member.user_id)
+           OR (friendship.requester_id=other_member.user_id AND friendship.addressee_id=mine.user_id))
+       WHERE mine.conversation_id=$1 AND mine.user_id=$2
+         AND friendship.estado='accepted'
+         AND NOT friendship.removed_by_requester AND NOT friendship.removed_by_addressee
+       LIMIT 1`, [conversationId, user.id]);
+    return rowCount > 0;
+  }
+  return true;
+}
+
 function initSocket(io) {
   _io = io;
 
@@ -18,8 +67,9 @@ function initSocket(io) {
       const token = socket.handshake.auth?.token;
       if (!token) return next(new Error('NO_TOKEN'));
       let payload;
-      try { payload = jwt.verify(token, JWT_SECRET); }
+      try { payload = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] }); }
       catch { return next(new Error('INVALID_TOKEN')); }
+      if (!isUuid(payload.sub)) return next(new Error('INVALID_TOKEN'));
       const { rows } = await db.query(
         'SELECT id, nombre, apodo, rol, skin, border, avatar_bg, foto_url, activo FROM users WHERE id = $1',
         [payload.sub]
@@ -34,7 +84,10 @@ function initSocket(io) {
 
   io.on('connection', (socket) => {
     const user = socket.user;
-    console.log(`Socket conectado: ${user.nombre} (${user.rol}) [${socket.id}]`);
+    console.log(`Socket conectado: ${user.id} (${user.rol}) [${socket.id}]`);
+    let messageWindowStart = Date.now();
+    let messageCount = 0;
+    let lastTypingAt = 0;
 
     // ── Sala personal de notificaciones ─────────────────────────
     // Cada usuario tiene su propia sala para recibir notificaciones
@@ -43,6 +96,7 @@ function initSocket(io) {
     // ── Chat global ──────────────────────────────────────────────
     socket.on('join_global', async () => {
       try {
+        if (!['student','teacher','admin'].includes(user.rol)) return;
         socket.join('global');
         const { rows: conv } = await db.query(
           "SELECT id FROM conversations WHERE type = 'global' LIMIT 1"
@@ -77,6 +131,7 @@ function initSocket(io) {
     // ── Chat grupal ──────────────────────────────────────────────
     socket.on('join_group', async (conversationId) => {
       try {
+        if (!isUuid(conversationId)) return;
         const { rows } = await db.query(
           'SELECT 1 FROM conversation_members WHERE conversation_id=$1 AND user_id=$2',
           [conversationId, user.id]
@@ -89,26 +144,48 @@ function initSocket(io) {
     // ── Chat personal ────────────────────────────────────────────
     socket.on('join_personal', async (conversationId) => {
       try {
+        if (!isUuid(conversationId)) return;
         const { rows } = await db.query(`
-          SELECT 1 FROM conversation_members
-          WHERE conversation_id = $1 AND user_id = $2
+          SELECT c.type, c.classroom_id
+            FROM conversation_members cm
+            JOIN conversations c ON c.id=cm.conversation_id
+           WHERE cm.conversation_id = $1 AND cm.user_id = $2
         `, [conversationId, user.id]);
         if (rows.length === 0) return;
-        socket.join(`personal:${conversationId}`);
+        if (!await canUseConversation(user, rows[0], conversationId)) return;
+        const room = conversationRoom(rows[0], conversationId);
+        if (room) socket.join(room);
       } catch (err) { console.error('join_personal error:', err); }
     });
 
     // ── Enviar mensaje ───────────────────────────────────────────
-    socket.on('send_message', async ({ conversation_id, texto, type }) => {
+    socket.on('send_message', async ({ conversation_id, texto } = {}) => {
       try {
-        if (!texto?.trim() || !conversation_id || !type) return;
+        const now = Date.now();
+        if (now - messageWindowStart >= 10_000) {
+          messageWindowStart = now;
+          messageCount = 0;
+        }
+        messageCount += 1;
+        if (messageCount > 20) {
+          socket.emit('error', { code: 'RATE_LIMITED', message: 'Estás enviando mensajes demasiado rápido' });
+          return;
+        }
+        if (typeof texto !== 'string' || !texto.trim() || !isUuid(conversation_id)) return;
         const textoClean = texto.trim().substring(0, 1000);
 
         const { rows: access } = await db.query(`
-          SELECT 1 FROM conversation_members
-          WHERE conversation_id = $1 AND user_id = $2
+          SELECT c.type, c.classroom_id
+          FROM conversation_members cm
+          JOIN conversations c ON c.id = cm.conversation_id
+          WHERE cm.conversation_id = $1 AND cm.user_id = $2
         `, [conversation_id, user.id]);
         if (access.length === 0) { socket.emit('error', { message: 'Sin acceso' }); return; }
+        const conversation = access[0];
+        if (!await canUseConversation(user, conversation, conversation_id)) {
+          socket.emit('error', { code: 'FORBIDDEN', message: 'Sin acceso' });
+          return;
+        }
 
         const { rows } = await db.query(`
           INSERT INTO messages (conversation_id, sender_id, texto)
@@ -145,24 +222,13 @@ function initSocket(io) {
           sender_name_color:  senderNameColor,
         };
 
-        let room;
-        if (type === 'global') {
-          room = 'global';
-        } else if (type === 'classroom') {
-          const { rows: conv } = await db.query(
-            'SELECT classroom_id FROM conversations WHERE id = $1', [conversation_id]);
-          if (conv.length > 0) room = `classroom:${conv[0].classroom_id}`;
-        } else if (type === 'personal') {
-          room = `personal:${conversation_id}`;
-        } else if (type === 'group') {
-          room = `group:${conversation_id}`;
-        }
+        const room = conversationRoom(conversation, conversation_id);
 
         if (room) io.to(room).emit('new_message', message);
 
         // ── Notificaciones a miembros que no están en la sala ────
         // Para personal: notificar al otro usuario
-        if (type === 'personal') {
+        if (conversation.type === 'personal') {
           const { rows: members } = await db.query(`
             SELECT user_id FROM conversation_members
             WHERE conversation_id = $1 AND user_id != $2
@@ -184,12 +250,21 @@ function initSocket(io) {
     });
 
     // ── Typing ───────────────────────────────────────────────────
-    socket.on('typing', ({ conversation_id, type }) => {
+    socket.on('typing', async ({ conversation_id } = {}) => {
       try {
-        let room;
-        if (type === 'global') room = 'global';
-        else if (type === 'classroom' && socket.classroomRoom) room = socket.classroomRoom;
-        else if (type === 'personal') room = `personal:${conversation_id}`;
+        const now = Date.now();
+        if (now - lastTypingAt < 400 || !isUuid(conversation_id)) return;
+        lastTypingAt = now;
+        const { rows } = await db.query(`
+          SELECT c.type, c.classroom_id
+          FROM conversation_members cm
+          JOIN conversations c ON c.id = cm.conversation_id
+          WHERE cm.conversation_id=$1 AND cm.user_id=$2
+        `, [conversation_id, user.id]);
+        if (!rows.length) return;
+        const conversation = rows[0];
+        if (!await canUseConversation(user, conversation, conversation_id)) return;
+        const room = conversationRoom(conversation, conversation_id);
         if (room) {
           socket.to(room).emit('user_typing', { user_id: user.id, nombre: user.nombre, conversation_id });
         }
@@ -197,7 +272,7 @@ function initSocket(io) {
     });
 
     socket.on('disconnect', (reason) => {
-      console.log(`Socket desconectado: ${user.nombre} — ${reason}`);
+      console.log(`Socket desconectado: ${user.id} — ${reason}`);
     });
   });
 }

@@ -10,13 +10,16 @@ const router  = express.Router();
 const db      = require('../config/db');
 const auth    = require('../middleware/auth');
 const roles   = require('../middleware/roles');
-const { getAccountByUserId } = require('../services/balance');
+const perms   = require('../middleware/perms');
+const uuidParams = require('../middleware/uuid-params');
+const { getAccountByUserId, assertSufficientBalance, lockAccountsForUpdate } = require('../services/balance');
 const { getIO } = require('../socket');
-const { v4: uuidv4 } = require('uuid');
+const { v4: uuidv4, validate: isUuid } = require('uuid');
 const crypto  = require('crypto');
 
 const COINS = 3;
 const TZ    = 'America/Argentina/Buenos_Aires';
+uuidParams(router, 'id', 'userId');
 
 function todayAR() {
   return new Date().toLocaleString('sv-SE', { timeZone: TZ }).slice(0, 10);
@@ -63,9 +66,18 @@ router.post('/checkin', auth, async (req, res) => {
   const client = await db.getClient();
   try {
     const hoy        = todayAR();
-    const mood       = req.body.mood ? Math.min(5, Math.max(1, parseInt(req.body.mood))) : 3;
-    const categories = Array.isArray(req.body.categories) ? req.body.categories.slice(0, 6) : [];
-    const nota       = req.body.nota ? req.body.nota.trim().slice(0, 500) : null;
+    const requestedMood = req.body.mood === undefined ? 3 : Number(req.body.mood);
+    if (!Number.isInteger(requestedMood) || requestedMood < 1 || requestedMood > 5) {
+      return res.status(400).json({ ok:false, error:{code:'INVALID_MOOD'} });
+    }
+    const mood = requestedMood;
+    const categories = Array.isArray(req.body.categories)
+      ? [...new Set(req.body.categories.filter(v => typeof v === 'string').map(v => v.trim().slice(0, 40)).filter(Boolean))].slice(0, 6)
+      : [];
+    const nota = typeof req.body.nota === 'string' ? req.body.nota.trim().slice(0, 500) || null : null;
+
+    await client.query('BEGIN');
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`wellness:${req.user.id}:${hoy}`]);
 
     // ¿Ya existe entrada para hoy?
     const { rows: existing } = await client.query(
@@ -73,8 +85,6 @@ router.post('/checkin', auth, async (req, res) => {
        WHERE user_id=$1 AND DATE(created_at AT TIME ZONE $2) = $3::date`,
       [req.user.id, TZ, hoy]
     );
-
-    await client.query('BEGIN');
 
     let entry, coinsAwarded = 0;
 
@@ -100,6 +110,9 @@ router.post('/checkin', auth, async (req, res) => {
         "SELECT id FROM accounts WHERE account_type='treasury' AND is_active=TRUE LIMIT 1"
       );
       const studentAcc = await getAccountByUserId(req.user.id, client);
+      if (!treasury.length) throw new Error('Cuenta de tesorería no configurada');
+      await lockAccountsForUpdate([treasury[0].id, studentAcc], client);
+      await assertSufficientBalance(treasury[0].id, COINS, client);
       const txId = uuidv4();
       await client.query(
         `INSERT INTO transactions (id, type, description, initiated_by, metadata)
@@ -228,7 +241,7 @@ router.post('/report', auth, async (req, res) => {
 });
 
 // ── GET /wellness/reports — admin/docente ─────────────────────
-router.get('/reports', auth, roles('admin', 'teacher'), async (req, res) => {
+router.get('/reports', auth, perms('psicologia'), async (req, res) => {
   try {
     const { rows } = await db.query(`
       SELECT wr.id, wr.tipo, wr.descripcion, wr.is_anonymous,
@@ -246,7 +259,7 @@ router.get('/reports', auth, roles('admin', 'teacher'), async (req, res) => {
 });
 
 // ── PATCH /wellness/reports/:id — marcar revisado ─────────────
-router.patch('/reports/:id', auth, roles('admin', 'teacher'), async (req, res) => {
+router.patch('/reports/:id', auth, perms('psicologia'), async (req, res) => {
   try {
     const { rows } = await db.query(
       `UPDATE wellness_reports SET reviewed=TRUE, reviewed_by=$1, reviewed_at=NOW()
@@ -425,7 +438,7 @@ function computeRisk(student, entries, unreadReports, cfg) {
 }
 
 // ── GET /wellness/admin/dashboard ────────────────────────────
-router.get('/admin/dashboard', auth, roles('admin', 'teacher'), async (req, res) => {
+router.get('/admin/dashboard', auth, perms('psicologia'), async (req, res) => {
   try {
     const today = todayAR();
     const [todayStats, moodDist, catStats, alertRows, unreadCnt, totalSt] = await Promise.all([
@@ -477,7 +490,7 @@ router.get('/admin/dashboard', auth, roles('admin', 'teacher'), async (req, res)
 });
 
 // ── GET /wellness/admin/students ─────────────────────────────
-router.get('/admin/students', auth, roles('admin', 'teacher'), async (req, res) => {
+router.get('/admin/students', auth, perms('psicologia'), async (req, res) => {
   try {
     const cfg    = await getWellnessCfg();
     const filter = req.query.filter || 'all';
@@ -521,7 +534,7 @@ router.get('/admin/students', auth, roles('admin', 'teacher'), async (req, res) 
 });
 
 // ── GET /wellness/admin/student/:userId ──────────────────────
-router.get('/admin/student/:userId', auth, roles('admin', 'teacher'), async (req, res) => {
+router.get('/admin/student/:userId', auth, perms('psicologia'), async (req, res) => {
   try {
     const cfg  = await getWellnessCfg();
     const uid  = req.params.userId;
@@ -583,7 +596,7 @@ router.get('/admin/student/:userId', auth, roles('admin', 'teacher'), async (req
 
 // ── GET /wellness/admin/explore ──────────────────────────────
 // Vista manual: todos los alumnos con su entrada más reciente del período, con nota
-router.get('/admin/explore', auth, roles('admin', 'teacher'), async (req, res) => {
+router.get('/admin/explore', auth, perms('psicologia'), async (req, res) => {
   try {
     const cfg    = await getWellnessCfg();
     const days   = Math.min(730, Math.max(1, parseInt(req.query.days) || 30));
@@ -653,7 +666,7 @@ router.get('/admin/explore', auth, roles('admin', 'teacher'), async (req, res) =
 });
 
 // ── GET /wellness/admin/config ───────────────────────────────
-router.get('/admin/config', auth, roles('admin', 'teacher'), async (req, res) => {
+router.get('/admin/config', auth, perms('psicologia'), async (req, res) => {
   try {
     res.json({ ok: true, data: await getWellnessCfg() });
   } catch (err) {
@@ -679,9 +692,13 @@ router.put('/admin/config', auth, roles('admin'), async (req, res) => {
 // BACKUPS CIFRADOS — AES-256-GCM
 // ══════════════════════════════════════════════════════════════
 
-function getBackupKey() {
-  const secret = process.env.JWT_SECRET || process.env.BACKUP_KEY || 'wellness_backup_default_key_change_in_prod';
+function deriveBackupKey(secret) {
   return crypto.createHash('sha256').update(secret + ':wellness_backup').digest();
+}
+
+function getBackupKeys() {
+  const secrets = [process.env.BACKUP_KEY, process.env.JWT_SECRET].filter(Boolean);
+  return [...new Set(secrets)].map(deriveBackupKey);
 }
 
 async function runBackup(periodDays = 730) {
@@ -712,7 +729,7 @@ async function runBackup(periodDays = 730) {
     reports:      reports.rows,
   });
 
-  const key    = getBackupKey();
+  const key    = getBackupKeys()[0];
   const iv     = crypto.randomBytes(16);
   const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
   const enc1   = cipher.update(payload, 'utf8', 'hex');
@@ -749,7 +766,11 @@ router.get('/admin/backups', auth, roles('admin'), async (req, res) => {
 // ── POST /wellness/admin/backups — generar backup manual ──────
 router.post('/admin/backups', auth, roles('admin'), async (req, res) => {
   try {
-    const days = Math.min(730, Math.max(7, parseInt(req.body?.days) || 730));
+    const requestedDays = req.body?.days === undefined ? 730 : Number(req.body.days);
+    if (!Number.isSafeInteger(requestedDays) || requestedDays < 7 || requestedDays > 730) {
+      return res.status(400).json({ ok:false, error:{code:'INVALID_PERIOD'} });
+    }
+    const days = requestedDays;
     const backup = await runBackup(days);
     res.status(201).json({ ok: true, data: backup });
   } catch (err) {
@@ -760,28 +781,33 @@ router.post('/admin/backups', auth, roles('admin'), async (req, res) => {
 // ── GET /wellness/admin/backups/:id/download ──────────────────
 router.get('/admin/backups/:id/download', auth, roles('admin'), async (req, res) => {
   try {
+    if (!isUuid(req.params.id)) return res.status(400).json({ ok:false, error:{code:'INVALID_ID'} });
     const { rows } = await db.query(
       `SELECT * FROM wellness_backups WHERE id=$1`, [req.params.id]
     );
     if (!rows.length) return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND' } });
 
     const b = rows[0];
-    const key    = getBackupKey();
     const iv     = Buffer.from(b.iv, 'hex');
     const authTag = Buffer.from(b.auth_tag, 'hex');
-    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
-    decipher.setAuthTag(authTag);
-    const dec1 = decipher.update(b.encrypted_data, 'hex', 'utf8');
-    const dec2 = decipher.final('utf8');
-    const plaintext = dec1 + dec2;
-
-    const checksum = crypto.createHash('sha256').update(plaintext).digest('hex');
-    if (checksum !== b.checksum) {
+    let plaintext = null;
+    for (const key of getBackupKeys()) {
+      try {
+        const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+        decipher.setAuthTag(authTag);
+        const candidate = decipher.update(b.encrypted_data, 'hex', 'utf8') + decipher.final('utf8');
+        const checksum = crypto.createHash('sha256').update(candidate).digest('hex');
+        if (checksum === b.checksum) { plaintext = candidate; break; }
+      } catch { /* Probar la clave histórica siguiente. */ }
+    }
+    if (plaintext === null) {
       return res.status(500).json({ ok: false, error: { code: 'CHECKSUM_MISMATCH', message: 'Integridad del backup comprometida' } });
     }
 
     res.setHeader('Content-Type', 'application/json');
     res.setHeader('Content-Disposition', `attachment; filename="wellness_backup_${b.created_at.toISOString().slice(0,10)}.json"`);
+    res.setHeader('Cache-Control', 'no-store, max-age=0');
+    res.setHeader('Pragma', 'no-cache');
     res.send(plaintext);
   } catch (err) {
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
@@ -791,6 +817,7 @@ router.get('/admin/backups/:id/download', auth, roles('admin'), async (req, res)
 // ── DELETE /wellness/admin/backups/:id ────────────────────────
 router.delete('/admin/backups/:id', auth, roles('admin'), async (req, res) => {
   try {
+    if (!isUuid(req.params.id)) return res.status(400).json({ ok:false, error:{code:'INVALID_ID'} });
     const { rows } = await db.query(`DELETE FROM wellness_backups WHERE id=$1 RETURNING id`, [req.params.id]);
     if (!rows.length) return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND' } });
     res.json({ ok: true });

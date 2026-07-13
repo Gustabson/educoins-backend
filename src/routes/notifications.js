@@ -9,6 +9,10 @@ const express = require('express');
 const router  = express.Router();
 const db      = require('../config/db');
 const auth    = require('../middleware/auth');
+const uuidParams = require('../middleware/uuid-params');
+const { validate: isUuid } = require('uuid');
+const toqueWindows = new Map();
+uuidParams(router, 'id');
 
 // ── GET /notifications/badge-counts ──────────────────────────
 // Returns unread/pending counts per section for the nav badges.
@@ -147,24 +151,37 @@ router.post('/push/subscribe', auth, async (req, res) => {
 // Enviar notificacion a otro usuario (ej: toque entre amigos)
 router.post('/send', auth, async (req, res) => {
   try {
-    const { to_user_id, type, message } = req.body;
-    if (!to_user_id || !type) {
-      return res.status(400).json({ ok: false, error: { code: 'INVALID_BODY', message: 'Faltan campos requeridos' } });
+    const { to_user_id, type } = req.body;
+    if (!isUuid(to_user_id) || type !== 'toque') {
+      return res.status(400).json({ ok: false, error: { code: 'INVALID_BODY', message: 'Notificación inválida' } });
     }
     if (to_user_id === req.user.id) {
       return res.status(400).json({ ok: false, error: { code: 'SELF_NOTIF', message: 'No podes mandarte una notificacion a vos mismo' } });
     }
 
-    const { rows: target } = await db.query(
-      'SELECT id FROM users WHERE id = $1 AND activo = TRUE',
-      [to_user_id]
-    );
+    const { rows: target } = await db.query(`
+      SELECT target_user.id
+        FROM users target_user
+        JOIN friendships friendship
+          ON ((friendship.requester_id=$1 AND friendship.addressee_id=target_user.id)
+           OR (friendship.addressee_id=$1 AND friendship.requester_id=target_user.id))
+       WHERE target_user.id=$2 AND target_user.activo=TRUE
+         AND friendship.estado='accepted'
+         AND NOT friendship.removed_by_requester AND NOT friendship.removed_by_addressee
+       LIMIT 1`, [req.user.id, to_user_id]);
     if (target.length === 0) {
       return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND', message: 'Usuario no encontrado' } });
     }
 
-    const titulo = type === 'toque' ? '👋 Te mandaron un toque' : (message || type);
-    const cuerpo = message || '';
+    const rateKey = `${req.user.id}:${to_user_id}`;
+    const now = Date.now();
+    if (now - (toqueWindows.get(rateKey) || 0) < 30_000) {
+      return res.status(429).json({ ok: false, error: { code: 'RATE_LIMITED', message: 'Esperá un momento antes de enviar otro toque' } });
+    }
+    toqueWindows.set(rateKey, now);
+
+    const titulo = '👋 Te mandaron un toque';
+    const cuerpo = `${req.user.nombre} te mandó un toque`;
 
     await db.query(`
       INSERT INTO notifications (user_id, tipo, titulo, cuerpo, data)

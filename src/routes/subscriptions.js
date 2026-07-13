@@ -9,9 +9,11 @@ const router  = express.Router();
 const db      = require('../config/db');
 const auth    = require('../middleware/auth');
 const roles   = require('../middleware/roles');
-const { getAccountByUserId, assertSufficientBalance, getTreasuryAccountId } = require('../services/balance');
+const uuidParams = require('../middleware/uuid-params');
+const { getAccountByUserId, assertSufficientBalance, getTreasuryAccountId, lockAccountsForUpdate } = require('../services/balance');
 const { v4: uuidv4 } = require('uuid');
 const { getIO } = require('../socket');
+uuidParams(router, 'id');
 
 // ── POST /subscriptions/subscribe ────────────────────────────
 router.post('/subscribe', auth, async (req, res) => {
@@ -20,6 +22,8 @@ router.post('/subscribe', auth, async (req, res) => {
     const { item_id, periodo } = req.body;
     if (!item_id || !periodo)
       return res.status(400).json({ ok: false, error: { code: 'MISSING_FIELDS' } });
+    if (!['weekly','monthly','annual'].includes(periodo))
+      return res.status(400).json({ ok: false, error: { code: 'INVALID_PERIOD' } });
 
     const { rows: item } = await db.query(
       'SELECT * FROM shop_items_custom WHERE id=$1 AND activo=TRUE AND es_suscripcion=TRUE', [item_id]
@@ -34,16 +38,19 @@ router.post('/subscribe', auth, async (req, res) => {
 
     if (precio === null || precio === undefined)
       return res.status(400).json({ ok: false, error: { code: 'NO_PRICE', message: 'Precio no configurado para este período' } });
-
-    // Verificar saldo
-    const accId = await getAccountByUserId(req.user.id, client);
-    if (precio > 0) await assertSufficientBalance(accId, precio, client);
+    if (!Number.isSafeInteger(Number(precio)) || Number(precio) < 0)
+      return res.status(400).json({ ok: false, error: { code: 'INVALID_PRICE' } });
 
     await client.query('BEGIN');
+
+    // Verificar saldo dentro de la transacción que realiza el débito
+    const accId = await getAccountByUserId(req.user.id, client);
 
     // Cobrar primer pago si tiene precio
     if (precio > 0) {
       const treasuryId = await getTreasuryAccountId(client);
+      await lockAccountsForUpdate([accId, treasuryId], client);
+      await assertSufficientBalance(accId, Number(precio), client);
       const txId = uuidv4();
       await client.query(`INSERT INTO transactions (id,type,description,initiated_by,metadata) VALUES ($1,'purchase',$2,$3,$4)`,
         [txId, `Suscripción ${item[0].nombre} (${periodo})`, req.user.id,
@@ -139,7 +146,19 @@ router.post('/charge-all', auth, roles('admin'), async (req, res) => {
     for (const sub of due) {
       try {
         await client.query('BEGIN');
+        const { rows: locked } = await client.query(
+          `SELECT id FROM subscriptions
+            WHERE id=$1 AND activo=TRUE AND next_charge <= NOW()
+            FOR UPDATE`,
+          [sub.id]
+        );
+        if (!locked.length) {
+          await client.query('ROLLBACK');
+          results.push({ user: sub.user_nombre, item: sub.item_nombre, status: 'already_processed' });
+          continue;
+        }
         const accId = await getAccountByUserId(sub.user_id, client);
+        await lockAccountsForUpdate([accId, treasuryId], client);
 
         // Verificar saldo — si no tiene, cancelar la suscripción
         const { rows: balRows } = await client.query(

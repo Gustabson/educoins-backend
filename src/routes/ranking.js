@@ -11,7 +11,10 @@ const router  = express.Router();
 const db      = require('../config/db');
 const auth    = require('../middleware/auth');
 const roles   = require('../middleware/roles');
+const uuidParams = require('../middleware/uuid-params');
 const { getIO } = require('../socket');
+uuidParams(router, 'id');
+const { validate: isUuid } = require('uuid');
 
 // ── Helpers de período ────────────────────────────────────────
 function getPeriodLabel(periodo) {
@@ -58,19 +61,21 @@ router.get('/live', auth, async (req, res) => {
     const periodo     = req.query.periodo || 'weekly';
     const scope       = req.query.scope   || 'global';
     const classroomId = req.query.classroom_id || null;
+    if (!['daily','weekly','monthly'].includes(periodo) || !['global','aula'].includes(scope) ||
+        (scope === 'aula' && !isUuid(classroomId))) {
+      return res.status(400).json({ ok:false, error:{ code:'INVALID_SCOPE', message:'Período o aula inválidos' } });
+    }
     const periodStart = getPeriodStart(periodo);
     const periodLabel = getPeriodLabel(periodo);
 
     // Filtro por aula
-    const aulaJoin = scope === 'aula' && classroomId
-      ? `JOIN classroom_members cm ON cm.user_id=u.id AND cm.classroom_id='${classroomId}'`
-      : scope === 'aula'
-      ? `JOIN classroom_members cm ON cm.user_id=u.id`
+    const aulaJoin = scope === 'aula'
+      ? 'JOIN classroom_members cm ON cm.user_id=u.id AND cm.classroom_id=$2'
       : '';
 
     // Ranking basado en monedas ganadas en el período
     const { rows } = await db.query(`
-      SELECT u.id, u.nombre, u.apodo, u.skin, u.border, u.avatar_bg, u.foto_url, u.foto_url, u.rol,
+      SELECT u.id, u.nombre, u.apodo, u.skin, u.border, u.avatar_bg, u.foto_url, u.rol,
         COALESCE(SUM(CASE WHEN le.amount > 0 AND t.created_at >= $1 THEN le.amount ELSE 0 END),0)::integer AS ganado_periodo,
         COALESCE(SUM(le.amount),0)::integer AS balance_total
       FROM users u
@@ -82,7 +87,7 @@ router.get('/live', auth, async (req, res) => {
       GROUP BY u.id
       ORDER BY ganado_periodo DESC, balance_total DESC
       LIMIT 20
-    `, [periodStart]);
+    `, scope === 'aula' ? [periodStart, classroomId] : [periodStart]);
 
     // Obtener configuración de premios para este período+scope
     const { rows: config } = await db.query(
@@ -92,8 +97,10 @@ router.get('/live', auth, async (req, res) => {
 
     // Marcar si ya se pagó este período
     const { rows: paid } = await db.query(
-      'SELECT 1 FROM ranking_payouts WHERE periodo=$1 AND scope=$2 AND periodo_label=$3 LIMIT 1',
-      [periodo, scope, periodLabel]
+      `SELECT 1 FROM ranking_payouts
+        WHERE periodo=$1 AND scope=$2 AND periodo_label=$3
+          AND classroom_id IS NOT DISTINCT FROM $4::uuid LIMIT 1`,
+      [periodo, scope, periodLabel, scope === 'aula' ? classroomId : null]
     );
 
     res.json({ ok: true, data: {
@@ -127,6 +134,11 @@ router.get('/config', auth, roles('admin'), async (req, res) => {
 router.patch('/config/:id', auth, roles('admin'), async (req, res) => {
   try {
     const { premio, activo } = req.body;
+    if (!isUuid(req.params.id) ||
+        (premio !== undefined && (!Number.isSafeInteger(Number(premio)) || Number(premio) < 0 || Number(premio) > 1000000)) ||
+        (activo !== undefined && typeof activo !== 'boolean')) {
+      return res.status(400).json({ ok:false, error:{ code:'INVALID_CONFIG' } });
+    }
     const { rows } = await db.query(
       'UPDATE ranking_config SET premio=COALESCE($1,premio), activo=COALESCE($2,activo), updated_at=NOW() WHERE id=$3 RETURNING *',
       [premio, activo, req.params.id]
@@ -142,6 +154,11 @@ router.patch('/config/:id', auth, roles('admin'), async (req, res) => {
 router.post('/config', auth, roles('admin'), async (req, res) => {
   try {
     const { periodo, scope, posicion, premio } = req.body;
+    if (!['daily','weekly','monthly'].includes(periodo) || !['global','aula'].includes(scope) ||
+        !Number.isSafeInteger(Number(posicion)) || Number(posicion) < 1 || Number(posicion) > 1000 ||
+        !Number.isSafeInteger(Number(premio)) || Number(premio) < 0 || Number(premio) > 1000000) {
+      return res.status(400).json({ ok:false, error:{ code:'INVALID_CONFIG' } });
+    }
     const { rows } = await db.query(`
       INSERT INTO ranking_config (periodo,scope,posicion,premio)
       VALUES ($1,$2,$3,$4)
@@ -160,20 +177,31 @@ router.post('/close', auth, roles('admin'), async (req, res) => {
   const client = await db.getClient();
   try {
     const { periodo, scope, classroom_id } = req.body;
+    if (!['daily','weekly','monthly'].includes(periodo) || !['global','aula'].includes(scope) ||
+        (scope === 'aula' && !isUuid(classroom_id))) {
+      return res.status(400).json({ ok:false, error:{code:'INVALID_SCOPE'} });
+    }
     const periodLabel = getPeriodLabel(periodo);
     const periodStart = getPeriodStart(periodo);
 
+    await client.query('BEGIN');
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`ranking:${periodo}:${scope}:${classroom_id || ''}:${periodLabel}`]);
+
     // Verificar que no se haya pagado ya
     const { rows: already } = await client.query(
-      'SELECT 1 FROM ranking_payouts WHERE periodo=$1 AND scope=$2 AND periodo_label=$3 LIMIT 1',
-      [periodo, scope, periodLabel]
+      `SELECT 1 FROM ranking_payouts
+        WHERE periodo=$1 AND scope=$2 AND periodo_label=$3
+          AND classroom_id IS NOT DISTINCT FROM $4::uuid LIMIT 1`,
+      [periodo, scope, periodLabel, scope === 'aula' ? classroom_id : null]
     );
-    if (already.length)
+    if (already.length) {
+      await client.query('ROLLBACK');
       return res.status(409).json({ ok: false, error: { code: 'ALREADY_PAID', message: 'Este período ya fue cerrado y pagado' } });
+    }
 
     // Obtener ranking actual
     const aulaJoin = scope === 'aula' && classroom_id
-      ? `JOIN classroom_members cm ON cm.user_id=u.id AND cm.classroom_id='${classroom_id}'`
+      ? 'JOIN classroom_members cm ON cm.user_id=u.id AND cm.classroom_id=$2'
       : '';
 
     const { rows: ranking } = await client.query(`
@@ -185,14 +213,12 @@ router.post('/close', auth, roles('admin'), async (req, res) => {
       LEFT JOIN transactions t ON t.id=le.transaction_id AND t.type IN ('reward','transfer')
       WHERE u.activo=TRUE AND u.rol='student'
       GROUP BY u.id ORDER BY ganado DESC LIMIT 20
-    `, [periodStart]);
+    `, scope === 'aula' ? [periodStart, classroom_id] : [periodStart]);
 
     const { rows: config } = await client.query(
       'SELECT posicion, premio FROM ranking_config WHERE periodo=$1 AND scope=$2 AND activo=TRUE AND premio>0 ORDER BY posicion',
       [periodo, scope]
     );
-
-    await client.query('BEGIN');
 
     const ledger = require('../services/ledger');
     const io = getIO();
@@ -202,34 +228,31 @@ router.post('/close', auth, roles('admin'), async (req, res) => {
       const user = ranking[cfg.posicion - 1];
       if (!user || user.ganado === 0) continue;
 
-      try {
-        const txId = await ledger.reward({
+      const txId = await ledger.reward({
           teacherId:   req.user.id,
           studentId:   user.id,
           amount:      cfg.premio,
           description: `Premio Ranking ${periodo} ${scope} - Posición #${cfg.posicion} (${periodLabel})`,
           meta:        { ranking: true, periodo, scope, posicion: cfg.posicion, period_label: periodLabel },
-        });
+          client,
+      });
 
-        const { rows: payout } = await client.query(`
-          INSERT INTO ranking_payouts (periodo, scope, periodo_label, user_id, posicion, premio, transaction_id)
-          VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *
-        `, [periodo, scope, periodLabel, user.id, cfg.posicion, cfg.premio, txId]);
+      const { rows: payout } = await client.query(`
+          INSERT INTO ranking_payouts (periodo, scope, periodo_label, classroom_id, user_id, posicion, premio, transaction_id)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *
+        `, [periodo, scope, periodLabel, scope === 'aula' ? classroom_id : null, user.id, cfg.posicion, cfg.premio, txId]);
 
-        payouts.push(payout[0]);
-
-        if (io) io.to(`user:${user.id}`).emit('notification', {
-          type: 'reward',
-          amount: cfg.premio,
-          description: `Premio Ranking #${cfg.posicion} del ${periodo === 'daily' ? 'día' : periodo === 'weekly' ? 'semana' : 'mes'}!`,
-          from: 'Ranking Aubank',
-        });
-      } catch(e) {
-        console.error(`Error pagando posición ${cfg.posicion}:`, e.message);
-      }
+      payouts.push(payout[0]);
     }
 
     await client.query('COMMIT');
+    for (const payout of payouts) {
+      if (io) io.to(`user:${payout.user_id}`).emit('notification', {
+        type: 'reward', amount: payout.premio,
+        description: `Premio Ranking #${payout.posicion} del ${periodo === 'daily' ? 'día' : periodo === 'weekly' ? 'semana' : 'mes'}!`,
+        from: 'Ranking EduCoins',
+      });
+    }
     res.json({ ok: true, data: { pagados: payouts.length, payouts } });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -258,19 +281,28 @@ router.post('/payouts/:id/revert', auth, roles('admin'), async (req, res) => {
   const client = await db.getClient();
   try {
     const { motivo } = req.body;
-    const { rows: pRows } = await client.query('SELECT * FROM ranking_payouts WHERE id=$1', [req.params.id]);
-    if (!pRows.length) return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND' } });
-    const payout = pRows[0];
-    if (payout.revertida) return res.status(409).json({ ok: false, error: { code: 'ALREADY_REVERTED' } });
-
+    if (!isUuid(req.params.id) || (motivo !== undefined && (typeof motivo !== 'string' || motivo.trim().length > 500))) {
+      return res.status(400).json({ ok:false, error:{ code:'INVALID_REVERSAL' } });
+    }
     await client.query('BEGIN');
+    const { rows: pRows } = await client.query('SELECT * FROM ranking_payouts WHERE id=$1 FOR UPDATE', [req.params.id]);
+    if (!pRows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND' } });
+    }
+    const payout = pRows[0];
+    if (payout.revertida) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ ok: false, error: { code: 'ALREADY_REVERTED' } });
+    }
 
-    const { getTreasuryAccountId, getAccountByUserId, assertSufficientBalance } = require('../services/balance');
+    const { getTreasuryAccountId, getAccountByUserId, assertSufficientBalance, lockAccountsForUpdate } = require('../services/balance');
     const { v4: uuidv4 } = require('uuid');
 
     const treasuryId = await getTreasuryAccountId(client);
     const userAccId  = await getAccountByUserId(payout.user_id, client);
-    await assertSufficientBalance(userAccId, payout.premio, client);
+    await lockAccountsForUpdate([userAccId, treasuryId], client);
+    await assertSufficientBalance(userAccId, Number(payout.premio), client);
 
     const revertId = uuidv4();
     await client.query(`

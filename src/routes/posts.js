@@ -12,6 +12,8 @@ const router  = express.Router();
 const db      = require('../config/db');
 const auth    = require('../middleware/auth');
 const roles   = require('../middleware/roles');
+const uuidParams = require('../middleware/uuid-params');
+uuidParams(router, 'id');
 
 // ── GET /posts ────────────────────────────────────────────────
 // Devuelve noticias activas, más recientes primero.

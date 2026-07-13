@@ -3,9 +3,11 @@ const express = require('express');
 const db      = require('../config/db');
 const auth    = require('../middleware/auth');
 const roles   = require('../middleware/roles');
+const uuidParams = require('../middleware/uuid-params');
 const { getBalance } = require('../services/balance');
 
 const router = express.Router();
+uuidParams(router, 'id');
 
 // ── GET /api/v1/accounts/me ───────────────────────────────────
 router.get('/me', auth, async (req, res) => {

@@ -133,11 +133,14 @@ CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action);
 
 -- Cuentas del sistema (sin user_id — son del sistema, no de personas)
 INSERT INTO accounts (id, user_id, account_type, label)
-VALUES
-  (uuid_generate_v4(), NULL, 'treasury', 'Tesorería del Sistema'),
-  (uuid_generate_v4(), NULL, 'store',    'Tienda Escolar'),
-  (uuid_generate_v4(), NULL, 'void',     'Cuenta Void')
-ON CONFLICT DO NOTHING;
+SELECT uuid_generate_v4(), NULL::uuid, 'treasury', 'Tesorería del Sistema'
+WHERE NOT EXISTS (SELECT 1 FROM accounts WHERE account_type='treasury')
+UNION ALL
+SELECT uuid_generate_v4(), NULL::uuid, 'store', 'Tienda Escolar'
+WHERE NOT EXISTS (SELECT 1 FROM accounts WHERE account_type='store')
+UNION ALL
+SELECT uuid_generate_v4(), NULL::uuid, 'void', 'Cuenta Void'
+WHERE NOT EXISTS (SELECT 1 FROM accounts WHERE account_type='void');
 
 -- ============================================================
 -- CÓMO CREAR EL PRIMER ADMIN (ejecutar manualmente):

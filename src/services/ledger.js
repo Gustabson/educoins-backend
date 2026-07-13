@@ -5,7 +5,12 @@
 
 const db = require('../config/db');
 const { v4: uuidv4 } = require('uuid');
-const { assertSufficientBalance, getTreasuryAccountId, getAccountByUserId } = require('./balance');
+const {
+  assertSufficientBalance,
+  lockAccountsForUpdate,
+  getTreasuryAccountId,
+  getAccountByUserId,
+} = require('./balance');
 const audit = require('./audit');
 
 // Importar io de socket para notificaciones en tiempo real
@@ -29,10 +34,22 @@ function notifyUser(userId, payload) {
  * @param {object} [meta]     - datos extra opcionales
  */
 async function createDoubleEntry(client, { type, description, initiatedBy, entries, meta = {} }) {
+  if (!Array.isArray(entries) || entries.length < 2) {
+    const err = new Error('Una transacción de doble entrada requiere al menos dos movimientos');
+    err.code = 'INVALID_ENTRIES';
+    throw err;
+  }
+  if (entries.some(e => !e.accountId || !Number.isSafeInteger(e.amount) || e.amount === 0)) {
+    const err = new Error('Las entradas del ledger deben usar montos enteros distintos de cero');
+    err.code = 'INVALID_LEDGER_ENTRY';
+    throw err;
+  }
   // Validar que las entradas sumen exactamente 0
   const sum = entries.reduce((acc, e) => acc + e.amount, 0);
   if (sum !== 0) {
-    throw new Error(`Las entradas del ledger deben sumar 0, sumaron ${sum}`);
+    const err = new Error(`Las entradas del ledger deben sumar 0, sumaron ${sum}`);
+    err.code = 'UNBALANCED_TRANSACTION';
+    throw err;
   }
 
   // Crear la transacción
@@ -60,6 +77,11 @@ async function createDoubleEntry(client, { type, description, initiatedBy, entri
 // Admin crea monedas y las acredita a la Tesorería
 // ─────────────────────────────────────────────────────────────
 async function mint({ adminId, amount, description }) {
+  if (!Number.isSafeInteger(amount) || amount <= 0) {
+    const err = new Error('El monto debe ser un entero positivo');
+    err.code = 'INVALID_AMOUNT';
+    throw err;
+  }
   const client = await db.getClient();
   try {
     await client.query('BEGIN');
@@ -95,13 +117,20 @@ async function mint({ adminId, amount, description }) {
 // OPERACIÓN 2: REWARD
 // Teacher aprueba misión → Tesorería → Alumno
 // ─────────────────────────────────────────────────────────────
-async function reward({ teacherId, studentId, amount, description, meta = {} }) {
-  const client = await db.getClient();
+async function reward({ teacherId, studentId, amount, description, meta = {}, client: externalClient = null }) {
+  if (!Number.isSafeInteger(amount) || amount <= 0) {
+    const err = new Error('El monto debe ser un entero positivo');
+    err.code = 'INVALID_AMOUNT';
+    throw err;
+  }
+  const client = externalClient || await db.getClient();
+  const ownsTransaction = !externalClient;
   try {
-    await client.query('BEGIN');
+    if (ownsTransaction) await client.query('BEGIN');
 
     const treasuryId    = await getTreasuryAccountId(client);
     const studentAccId  = await getAccountByUserId(studentId, client);
+    await lockAccountsForUpdate([treasuryId, studentAccId], client);
 
     // Verificar que la Tesorería tenga saldo
     await assertSufficientBalance(treasuryId, amount, client);
@@ -109,7 +138,8 @@ async function reward({ teacherId, studentId, amount, description, meta = {} }) 
     // Verificar presupuesto mensual del teacher
     const budgetResult = await client.query(
       `SELECT monthly_limit, current_spent FROM teacher_budgets
-       WHERE teacher_id = $1 AND month = DATE_TRUNC('month', NOW())`,
+       WHERE teacher_id = $1 AND month = DATE_TRUNC('month', NOW())
+       FOR UPDATE`,
       [teacherId]
     );
     if (budgetResult.rows.length > 0) {
@@ -139,15 +169,17 @@ async function reward({ teacherId, studentId, amount, description, meta = {} }) 
     });
 
     await audit.log({ actorId: teacherId, action: 'reward', targetType: 'user', targetId: studentId, details: { amount, description } }, client);
-    await client.query('COMMIT');
-    // Notificar al alumno en tiempo real
-    notifyUser(studentId, { type: 'reward', amount, description, from: 'Docente' });
+    if (ownsTransaction) {
+      await client.query('COMMIT');
+      // Cuando forma parte de una transacción mayor, la ruta notifica tras su COMMIT.
+      notifyUser(studentId, { type: 'reward', amount, description, from: 'Docente' });
+    }
     return txId;
   } catch (err) {
-    await client.query('ROLLBACK');
+    if (ownsTransaction) await client.query('ROLLBACK');
     throw err;
   } finally {
-    client.release();
+    if (ownsTransaction) client.release();
   }
 }
 
@@ -156,6 +188,11 @@ async function reward({ teacherId, studentId, amount, description, meta = {} }) 
 // Alumno → Alumno
 // ─────────────────────────────────────────────────────────────
 async function transfer({ fromUserId, toUserId, amount, description }) {
+  if (!Number.isSafeInteger(amount) || amount <= 0) {
+    const err = new Error('El monto debe ser un entero positivo');
+    err.code = 'INVALID_AMOUNT';
+    throw err;
+  }
   if (fromUserId === toUserId) {
     const err = new Error('No podés transferirte monedas a vos mismo');
     err.code = 'SELF_TRANSFER';
@@ -169,6 +206,7 @@ async function transfer({ fromUserId, toUserId, amount, description }) {
     const fromAccId = await getAccountByUserId(fromUserId, client);
     const toAccId   = await getAccountByUserId(toUserId, client);
 
+    await lockAccountsForUpdate([fromAccId, toAccId], client);
     await assertSufficientBalance(fromAccId, amount, client);
 
     const txId = await createDoubleEntry(client, {
@@ -205,7 +243,12 @@ async function purchase({ studentId, itemId }) {
 
     // Leer precio y stock desde la BD (nunca confiar en el cliente)
     const itemResult = await client.query(
-      'SELECT id, nombre, precio, stock, activo FROM store_items WHERE id = $1',
+      `SELECT si.id, si.nombre, si.precio, si.stock, si.activo, si.published_by,
+              publisher.rol AS publisher_role
+       FROM store_items si
+       LEFT JOIN users publisher ON publisher.id = si.published_by
+       WHERE si.id = $1
+       FOR UPDATE OF si`,
       [itemId]
     );
     if (itemResult.rows.length === 0 || !itemResult.rows[0].activo) {
@@ -216,21 +259,26 @@ async function purchase({ studentId, itemId }) {
 
     const item = itemResult.rows[0];
 
+    if (item.published_by === studentId) {
+      const err = new Error('No podés comprar tu propio anuncio');
+      err.code = 'SELF_PURCHASE';
+      throw err;
+    }
+
     if (item.stock === 0) {
       const err = new Error('Este ítem está agotado');
       err.code = 'OUT_OF_STOCK';
       throw err;
     }
 
-    // Buscar cuenta del alumno y de la tienda
+    // Las ventas entre alumnos acreditan al vendedor. Los artículos
+    // institucionales financian la Tesorería.
     const studentAccId = await getAccountByUserId(studentId, client);
-    // Las compras van a la Tesorería — el tesoro recauda las ventas
-    const storeResult  = await client.query(
-      "SELECT id FROM accounts WHERE account_type = 'treasury' AND is_active = true LIMIT 1"
-    );
-    const storeAccId = storeResult.rows[0]?.id;
-    if (!storeAccId) throw new Error('Cuenta de tesoreria no configurada');
+    const destinationAccId = item.publisher_role === 'student'
+      ? await getAccountByUserId(item.published_by, client)
+      : await getTreasuryAccountId(client);
 
+    await lockAccountsForUpdate([studentAccId, destinationAccId], client);
     await assertSufficientBalance(studentAccId, item.precio, client);
 
     const txId = await createDoubleEntry(client, {
@@ -239,9 +287,13 @@ async function purchase({ studentId, itemId }) {
       initiatedBy: studentId,
       entries: [
         { accountId: studentAccId, amount: -item.precio },
-        { accountId: storeAccId,   amount: +item.precio },
+        { accountId: destinationAccId, amount: +item.precio },
       ],
-      meta: { referenceId: itemId, referenceType: 'store_item' },
+      meta: {
+        referenceId: itemId,
+        referenceType: 'store_item',
+        sellerId: item.publisher_role === 'student' ? item.published_by : null,
+      },
     });
 
     // Decrementar stock si no es ilimitado
@@ -254,6 +306,14 @@ async function purchase({ studentId, itemId }) {
 
     await audit.log({ actorId: studentId, action: 'purchase', targetType: 'store_item', targetId: itemId, details: { precio: item.precio, nombre: item.nombre } }, client);
     await client.query('COMMIT');
+    if (item.publisher_role === 'student') {
+      notifyUser(item.published_by, {
+        type: 'store_sale',
+        amount: item.precio,
+        item_id: item.id,
+        item_nombre: item.nombre,
+      });
+    }
     return txId;
   } catch (err) {
     await client.query('ROLLBACK');
@@ -268,6 +328,16 @@ async function purchase({ studentId, itemId }) {
 // Admin corrige un error con motivo obligatorio
 // ─────────────────────────────────────────────────────────────
 async function adjustment({ adminId, fromAccountId, toAccountId, amount, reason }) {
+  if (!Number.isSafeInteger(amount) || amount <= 0) {
+    const err = new Error('El monto debe ser un entero positivo');
+    err.code = 'INVALID_AMOUNT';
+    throw err;
+  }
+  if (fromAccountId === toAccountId) {
+    const err = new Error('Las cuentas de origen y destino deben ser diferentes');
+    err.code = 'SAME_ACCOUNT';
+    throw err;
+  }
   if (!reason || reason.trim().length < 5) {
     const err = new Error('El motivo del ajuste es obligatorio (mínimo 5 caracteres)');
     err.code = 'REASON_REQUIRED';
@@ -277,6 +347,9 @@ async function adjustment({ adminId, fromAccountId, toAccountId, amount, reason 
   const client = await db.getClient();
   try {
     await client.query('BEGIN');
+
+    await lockAccountsForUpdate([fromAccountId, toAccountId], client);
+    await assertSufficientBalance(fromAccountId, amount, client);
 
     const txId = await createDoubleEntry(client, {
       type: 'adjustment',
@@ -324,6 +397,7 @@ async function burn({ adminId, amount, reason }) {
     const treasuryId = await getTreasuryAccountId(client);
 
     // Verificar que la Tesorería tenga saldo suficiente para quemar
+    await lockAccountsForUpdate([treasuryId], client);
     await assertSufficientBalance(treasuryId, amount, client);
 
     // Entrada única negativa — destruye monedas de la Tesorería
@@ -357,4 +431,4 @@ async function burn({ adminId, amount, reason }) {
   }
 }
 
-module.exports = { mint, burn, reward, transfer, purchase, adjustment };
+module.exports = { createDoubleEntry, mint, burn, reward, transfer, purchase, adjustment };

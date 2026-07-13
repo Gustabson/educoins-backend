@@ -30,6 +30,11 @@ async function getBalance(accountId, client) {
  * @param {object} [client]
  */
 async function assertSufficientBalance(accountId, amount, client) {
+  if (!Number.isSafeInteger(amount) || amount <= 0) {
+    const err = new Error('El monto debe ser un entero positivo');
+    err.code = 'INVALID_AMOUNT';
+    throw err;
+  }
   const balance = await getBalance(accountId, client);
   if (balance < amount) {
     const err = new Error('Saldo insuficiente');
@@ -39,6 +44,29 @@ async function assertSufficientBalance(accountId, amount, client) {
     throw err;
   }
   return balance;
+}
+
+/**
+ * Serializes operations that can debit the same account. Balance is derived
+ * from ledger entries, so checking it without first locking the account row
+ * allows concurrent requests to spend the same funds.
+ */
+async function lockAccountsForUpdate(accountIds, client) {
+  if (!client) throw new Error('Se requiere una transacción para bloquear cuentas');
+  const ids = [...new Set(accountIds.filter(Boolean))].sort();
+  if (ids.length === 0) return;
+  const { rows } = await client.query(
+    `SELECT id FROM accounts
+     WHERE id = ANY($1::uuid[]) AND is_active = TRUE
+     ORDER BY id
+     FOR UPDATE`,
+    [ids]
+  );
+  if (rows.length !== ids.length) {
+    const err = new Error('Una de las cuentas no existe o está inactiva');
+    err.code = 'ACCOUNT_NOT_FOUND';
+    throw err;
+  }
 }
 
 /**
@@ -77,4 +105,25 @@ async function getTreasuryAccountId(client) {
   return rows[0].id;
 }
 
-module.exports = { getBalance, assertSufficientBalance, getAccountByUserId, getTreasuryAccountId };
+/** Obtiene la cuenta sistémica reservada exclusivamente para garantías P2P. */
+async function getEscrowAccountId(client) {
+  const executor = client || db;
+  const { rows } = await executor.query(
+    "SELECT id FROM accounts WHERE account_type = 'escrow' AND is_active = true LIMIT 1"
+  );
+  if (rows.length === 0) {
+    const err = new Error('Cuenta de garantía P2P no encontrada');
+    err.code = 'ESCROW_NOT_FOUND';
+    throw err;
+  }
+  return rows[0].id;
+}
+
+module.exports = {
+  getBalance,
+  assertSufficientBalance,
+  lockAccountsForUpdate,
+  getAccountByUserId,
+  getTreasuryAccountId,
+  getEscrowAccountId,
+};

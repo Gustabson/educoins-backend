@@ -4,8 +4,10 @@ const router     = express.Router();
 const db         = require('../config/db');
 const auth       = require('../middleware/auth');
 const roles      = require('../middleware/roles');
+const uuidParams = require('../middleware/uuid-params');
 const ledger     = require('../services/ledger');
-const { getBalance, getAccountByUserId, assertSufficientBalance } = require('../services/balance');
+const { getBalance, getAccountByUserId, assertSufficientBalance, lockAccountsForUpdate } = require('../services/balance');
+uuidParams(router, 'id');
 
 router.use(auth, roles('parent'));
 
@@ -241,8 +243,8 @@ router.patch('/children-verdicts/read', async (req, res) => {
 router.post('/burn', async (req, res) => {
   try {
     const { amount, motivo } = req.body;
-    const amt = parseInt(amount);
-    if (!amt || amt <= 0)
+    const amt = Number(amount);
+    if (!Number.isSafeInteger(amt) || amt <= 0)
       return res.status(400).json({ ok: false, error: { code: 'INVALID_AMOUNT', message: 'El monto debe ser un entero positivo' } });
 
     // Verificar balance suficiente
@@ -253,12 +255,14 @@ router.post('/burn', async (req, res) => {
 
     // Quemar: debit parent account, credit treasury (net-zero via transfer to treasury then burn)
     // Pattern: transfer from parent to treasury
-    const { getTreasuryAccountId } = require('../services/balance');
+      const { getTreasuryAccountId } = require('../services/balance');
     const client = await db.getClient();
     try {
       await client.query('BEGIN');
       const { v4: uuidv4 } = require('uuid');
       const treasuryId = await getTreasuryAccountId(client);
+      await lockAccountsForUpdate([accountId, treasuryId], client);
+      await assertSufficientBalance(accountId, amt, client);
       const desc = motivo?.trim() ? `Burn padre: ${motivo}` : 'Burn de monedas (padre)';
 
       // Insert transaction

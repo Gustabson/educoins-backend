@@ -9,8 +9,8 @@
 //   - rol='admin' (superadmin)
 //   - permisos que incluyen '*' (wildcard)
 //
-// Para acceso a psicología también se mantiene compatibilidad con rol='teacher'
-// hasta que las cuentas staff sean migradas completamente.
+// Los datos de psicología requieren permiso explícito; ser docente no concede
+// acceso global a información sensible de alumnos.
 
 function perms(...required) {
   return (req, res, next) => {
@@ -30,9 +30,6 @@ function perms(...required) {
 
     // Wildcard: acceso total
     if (userPerms.includes('*')) return next();
-
-    // Compatibilidad: docentes pueden acceder a endpoints de psicología
-    if (u.rol === 'teacher' && required.includes('psicologia')) return next();
 
     // Chequear si tiene al menos uno de los permisos requeridos
     if (required.some(p => userPerms.includes(p))) return next();

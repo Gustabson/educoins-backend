@@ -4,9 +4,11 @@ const { v4: uuidv4 } = require('uuid');
 const db     = require('../config/db');
 const auth   = require('../middleware/auth');
 const roles  = require('../middleware/roles');
+const uuidParams = require('../middleware/uuid-params');
 const ledger = require('../services/ledger');
 const { getIO } = require('../socket');
 const router = express.Router();
+uuidParams(router, 'id');
 
 // Auto-migrate new columns
 db.query(`ALTER TABLE missions ADD COLUMN IF NOT EXISTS imagen_url TEXT`)
@@ -290,6 +292,14 @@ router.post('/:id/submit', auth, roles('student'), async (req, res) => {
 
       // Create submission (student_id = submitter, but reward goes to all members on approve)
       await client.query('BEGIN');
+      const { rows: lockedGroup } = await client.query(
+        "SELECT id FROM mission_groups WHERE id=$1 AND mission_id=$2 AND status='ready' AND submission_id IS NULL FOR UPDATE",
+        [group_id, req.params.id]
+      );
+      if (!lockedGroup.length) {
+        await client.query('ROLLBACK');
+        return res.status(422).json({ ok:false, error:{code:'GROUP_ALREADY_SUBMITTED'} });
+      }
       const subId = uuidv4();
       await client.query(
         "INSERT INTO mission_submissions (id,mission_id,student_id,estado,feedback) VALUES ($1,$2,$3,'pendiente',$4)",
@@ -319,11 +329,21 @@ router.post('/:id/submit', auth, roles('student'), async (req, res) => {
 
     if (mission.auto_approve) {
       await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`mission:${mission.id}:${req.user.id}`]);
+      const { rows: duplicate } = await client.query(
+        "SELECT 1 FROM mission_submissions WHERE mission_id=$1 AND student_id=$2 AND estado!='rechazada' LIMIT 1",
+        [mission.id, req.user.id]
+      );
+      if (duplicate.length) {
+        await client.query('ROLLBACK');
+        return res.status(422).json({ ok:false, error:{code:'DUPLICATE_SUBMISSION'} });
+      }
       const txId = await ledger.reward({
         teacherId: mission.created_by, studentId: req.user.id,
         amount: mission.recompensa,
         description: `Mision completada: ${mission.titulo}`,
         meta: { referenceId: mission.id, referenceType: 'mission' },
+        client,
       });
       const { rows } = await client.query(
         "INSERT INTO mission_submissions (id,mission_id,student_id,estado,feedback,reviewed_at,reviewed_by,transaction_id) VALUES ($1,$2,$3,'aprobada','¡Completada!',$4,$5,$6) RETURNING *",
@@ -335,10 +355,21 @@ router.post('/:id/submit', auth, roles('student'), async (req, res) => {
     }
 
     // Normal submission
+    await client.query('BEGIN');
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`mission:${mission.id}:${req.user.id}`]);
+    const { rows: duplicate } = await client.query(
+      "SELECT 1 FROM mission_submissions WHERE mission_id=$1 AND student_id=$2 AND estado!='rechazada' LIMIT 1",
+      [mission.id, req.user.id]
+    );
+    if (duplicate.length) {
+      await client.query('ROLLBACK');
+      return res.status(422).json({ ok:false, error:{code:'DUPLICATE_SUBMISSION'} });
+    }
     const { rows } = await client.query(
       "INSERT INTO mission_submissions (id,mission_id,student_id,estado,feedback) VALUES ($1,$2,$3,'pendiente',$4) RETURNING *",
       [uuidv4(), req.params.id, req.user.id, comentario||null]
     );
+    await client.query('COMMIT');
     notify(mission.created_by, { type:'new_submission', alumno:req.user.nombre, mision:mission.titulo });
     res.status(201).json({ ok: true, data: rows[0] });
   } catch (err) {
@@ -370,18 +401,25 @@ router.post('/submissions/:id/approve', auth, roles('teacher','admin'), async (r
   const client = await db.getClient();
   try {
     const { feedback } = req.body;
+    await client.query('BEGIN');
     const { rows: sRows } = await client.query(`
       SELECT ms.*, m.recompensa, m.titulo, m.xp_bonus, m.created_by, m.tipo, m.requires_peer_eval
       FROM mission_submissions ms JOIN missions m ON ms.mission_id=m.id WHERE ms.id=$1
+      FOR UPDATE OF ms
     `, [req.params.id]);
-    if (!sRows.length) return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND' } });
+    if (!sRows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND' } });
+    }
     const sub = sRows[0];
-    if (req.user.rol==='teacher' && sub.created_by!==req.user.id)
+    if (req.user.rol==='teacher' && sub.created_by!==req.user.id) {
+      await client.query('ROLLBACK');
       return res.status(403).json({ ok: false, error: { code: 'UNAUTHORIZED' } });
-    if (sub.estado!=='pendiente')
+    }
+    if (sub.estado!=='pendiente') {
+      await client.query('ROLLBACK');
       return res.status(422).json({ ok: false, error: { code: 'INVALID_STATE' } });
-
-    await client.query('BEGIN');
+    }
 
     // ── Grupal: reward ALL group members ──────────────────────
     if (sub.tipo === 'grupal') {
@@ -399,6 +437,7 @@ router.post('/submissions/:id/approve', auth, roles('teacher','admin'), async (r
             teacherId: req.user.id, studentId: m.user_id,
             amount: sub.recompensa, description: `Mision grupal completada: ${sub.titulo}`,
             meta: { referenceId: sub.mission_id, referenceType: 'mission', group_id: groupId },
+            client,
           });
           if (!firstTxId) firstTxId = txId;
           await saveNotif(client, m.user_id, 'mission_approved',
@@ -432,6 +471,7 @@ router.post('/submissions/:id/approve', auth, roles('teacher','admin'), async (r
       teacherId: req.user.id, studentId: sub.student_id,
       amount: sub.recompensa, description: `Mision completada: ${sub.titulo}`,
       meta: { referenceId: sub.mission_id, referenceType: 'mission' },
+      client,
     });
     await client.query(
       "UPDATE mission_submissions SET estado='aprobada',reviewed_at=NOW(),reviewed_by=$1,transaction_id=$2,feedback=$3 WHERE id=$4",
@@ -456,15 +496,27 @@ router.post('/submissions/:id/reject', auth, roles('teacher','admin'), async (re
   try {
     const { reason, feedback } = req.body;
     const fb = feedback||reason;
-    if (!fb) return res.status(400).json({ ok: false, error: { code: 'MISSING_FIELDS' } });
+    if (typeof fb !== 'string' || !fb.trim() || fb.trim().length > 1000) return res.status(400).json({ ok: false, error: { code: 'MISSING_FIELDS' } });
+    await client.query('BEGIN');
     const { rows: sRows } = await client.query(
-      'SELECT ms.student_id, m.titulo FROM mission_submissions ms JOIN missions m ON ms.mission_id=m.id WHERE ms.id=$1',
+      "SELECT ms.student_id, ms.estado, m.titulo, m.created_by FROM mission_submissions ms JOIN missions m ON ms.mission_id=m.id WHERE ms.id=$1 FOR UPDATE OF ms",
       [req.params.id]
     );
-    await client.query('BEGIN');
+    if (!sRows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ ok:false, error:{code:'NOT_FOUND'} });
+    }
+    if (req.user.rol === 'teacher' && sRows[0].created_by !== req.user.id) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ ok:false, error:{code:'FORBIDDEN'} });
+    }
+    if (sRows[0].estado !== 'pendiente') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ ok:false, error:{code:'INVALID_STATE'} });
+    }
     await client.query(
       "UPDATE mission_submissions SET estado='rechazada',reviewed_at=NOW(),reviewed_by=$1,feedback=$2 WHERE id=$3",
-      [req.user.id, fb, req.params.id]
+      [req.user.id, fb.trim(), req.params.id]
     );
     if (sRows.length) {
       await saveNotif(client, sRows[0].student_id, 'mission_rejected',
@@ -484,16 +536,19 @@ router.post('/reward-direct', auth, roles('teacher','admin'), async (req, res) =
   const client = await db.getClient();
   try {
     const { student_id, amount, descripcion } = req.body;
-    if (!student_id || !amount || amount<=0)
+    const rewardAmount = Number(amount);
+    if (!student_id || !Number.isSafeInteger(rewardAmount) || rewardAmount <= 0 || rewardAmount > 1000000 ||
+        (descripcion !== undefined && typeof descripcion !== 'string'))
       return res.status(400).json({ ok: false, error: { code: 'MISSING_FIELDS' } });
     await client.query('BEGIN');
     const txId = await ledger.reward({
       teacherId: req.user.id, studentId: student_id,
-      amount: parseInt(amount),
-      description: descripcion || `Premio directo de ${req.user.nombre}`,
+      amount: rewardAmount,
+      description: descripcion?.trim().slice(0, 500) || `Premio directo de ${req.user.nombre}`,
+      client,
     });
     await client.query('COMMIT');
-    notify(student_id, { type:'reward', amount:parseInt(amount), description:descripcion||`Premio de ${req.user.nombre}`, from:req.user.nombre });
+    notify(student_id, { type:'reward', amount:rewardAmount, description:descripcion||`Premio de ${req.user.nombre}`, from:req.user.nombre });
     res.json({ ok: true, data: { transaction_id: txId } });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -512,31 +567,37 @@ router.post('/:id/reward-all', auth, roles('teacher','admin'), async (req, res) 
     if (!isAdmin && mission.created_by !== req.user.id)
       return res.status(403).json({ ok: false, error: { code: 'FORBIDDEN' } });
 
+    await client.query('BEGIN');
     const { rows: pending } = await client.query(
-      "SELECT ms.*, u.nombre AS alumno_nombre FROM mission_submissions ms JOIN users u ON u.id=ms.student_id WHERE ms.mission_id=$1 AND ms.estado='pendiente'",
+      "SELECT ms.*, u.nombre AS alumno_nombre FROM mission_submissions ms JOIN users u ON u.id=ms.student_id WHERE ms.mission_id=$1 AND ms.estado='pendiente' FOR UPDATE OF ms",
       [req.params.id]
     );
-    if (!pending.length) return res.json({ ok: true, data: { count: 0 } });
+    if (!pending.length) {
+      await client.query('ROLLBACK');
+      return res.json({ ok: true, data: { count: 0 } });
+    }
 
-    await client.query('BEGIN');
     let count = 0;
+    const rewarded = [];
     for (const sub of pending) {
-      try {
-        const txId = await ledger.reward({
-          teacherId: req.user.id, studentId: sub.student_id,
-          amount: mission.recompensa,
-          description: `Mision completada: ${mission.titulo}`,
-          meta: { referenceId: mission.id, referenceType: 'mission' },
-        });
-        await client.query(
-          "UPDATE mission_submissions SET estado='aprobada',reviewed_at=NOW(),reviewed_by=$1,transaction_id=$2 WHERE id=$3",
-          [req.user.id, txId, sub.id]
-        );
-        notify(sub.student_id, { type:'reward', amount:mission.recompensa, description:`Mision aprobada: ${mission.titulo}` });
-        count++;
-      } catch(e) { /* skip if budget exceeded */ }
+      const txId = await ledger.reward({
+        teacherId: req.user.id, studentId: sub.student_id,
+        amount: mission.recompensa,
+        description: `Mision completada: ${mission.titulo}`,
+        meta: { referenceId: mission.id, referenceType: 'mission' },
+        client,
+      });
+      await client.query(
+        "UPDATE mission_submissions SET estado='aprobada',reviewed_at=NOW(),reviewed_by=$1,transaction_id=$2 WHERE id=$3",
+        [req.user.id, txId, sub.id]
+      );
+      rewarded.push(sub.student_id);
+      count++;
     }
     await client.query('COMMIT');
+    for (const studentId of rewarded) {
+      notify(studentId, { type:'reward', amount:mission.recompensa, description:`Mision aprobada: ${mission.titulo}` });
+    }
     res.json({ ok: true, data: { count } });
   } catch(err) {
     await client.query('ROLLBACK').catch(()=>{});

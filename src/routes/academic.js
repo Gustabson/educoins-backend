@@ -2,6 +2,8 @@ const express = require('express');
 const router  = express.Router();
 const { query } = require('../config/db');
 const auth    = require('../middleware/auth');
+const integerParams = require('../middleware/integer-params');
+integerParams(router, 'id');
 
 // ── Startup migration ─────────────────────────────────────────
 query(`

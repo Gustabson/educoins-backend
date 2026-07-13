@@ -2,20 +2,42 @@
 // Punto de entrada del servidor.
 // Configura Express + Socket.io, registra rutas y arranca.
 
-const { PORT } = require('./config/env');
+const { PORT, NODE_ENV, FRONTEND_URL } = require('./config/env');
 const express  = require('express');
 const cors     = require('cors');
+const helmet   = require('helmet');
+const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
 const http     = require('http');
+const crypto   = require('crypto');
 const { Server } = require('socket.io');
 const initSocket = require('./socket');
+const { runCoreMigrations } = require('./config/migrations');
+const { expirePendingOrders } = require('./services/p2p');
+const { processDueTaxes } = require('./services/taxes');
+const sanitizeErrors = require('./middleware/sanitize-errors');
 
 const app    = express();
 const server = http.createServer(app);
+app.disable('x-powered-by');
+if (NODE_ENV === 'production') app.set('trust proxy', 1);
+
+const isAllowedOrigin = origin => {
+  if (!origin) return true;
+  if (origin === FRONTEND_URL || origin === 'https://educoins-frontend.vercel.app') return true;
+  if (/^https:\/\/educoins-frontend(?:-[a-z0-9]+)*\.vercel\.app$/i.test(origin)) return true;
+  if (NODE_ENV !== 'production' && /^http:\/\/(localhost|127\.0\.0\.1):(3000|3001|4173|5173)$/i.test(origin)) return true;
+  return false;
+};
+
+const corsOrigin = (origin, callback) => callback(null, isAllowedOrigin(origin));
 
 // ── Socket.io ─────────────────────────────────────────────────
 const io = new Server(server, {
+  serveClient: false,
+  maxHttpBufferSize: 100_000,
+  perMessageDeflate: false,
   cors: {
-    origin: ['https://educoins-frontend.vercel.app', 'http://localhost:3000', /\.vercel\.app$/],
+    origin: corsOrigin,
     methods: ['GET', 'POST'],
     credentials: true,
   }
@@ -25,11 +47,7 @@ app.set('io', io); // Exponer io para req.app.get('io') en rutas
 
 // ── Middlewares globales ──────────────────────────────────────
 const corsOptions = {
-  origin: [
-    'https://educoins-frontend.vercel.app',
-    'http://localhost:3000',
-    /\.vercel\.app$/,
-  ],
+  origin: corsOrigin,
   methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
   allowedHeaders: ['Content-Type','Authorization'],
   credentials: true,
@@ -38,7 +56,42 @@ const corsOptions = {
 // Responder preflight OPTIONS — fix CORS 2026-03-25 00:30 en todas las rutas — necesario para CORS con POST/PATCH/DELETE
 app.options('*', cors(corsOptions));
 app.use(cors(corsOptions));
-app.use(express.json());
+app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
+app.use((req, res, next) => {
+  req.id = req.get('x-request-id') || crypto.randomUUID();
+  res.setHeader('x-request-id', req.id);
+  next();
+});
+app.use(express.json({ limit: '1mb', strict: true }));
+app.use(sanitizeErrors);
+
+const rateLimitHandler = (req, res) => res.status(429).json({
+  ok: false,
+  error: { code: 'RATE_LIMITED', message: 'Demasiadas solicitudes. Esperá un momento e intentá de nuevo.' }
+});
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 3000,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  handler: rateLimitHandler,
+});
+const loginLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  limit: 8,
+  keyGenerator: req => `${ipKeyGenerator(req.ip)}:${String(req.body?.email || '').trim().toLowerCase()}`,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  skipSuccessfulRequests: true,
+  handler: rateLimitHandler,
+});
+app.use('/api', apiLimiter);
+app.use('/api/v1/auth/login', loginLimiter);
+
+let applicationRegistered = false;
+function registerApplication() {
+  if (applicationRegistered) return;
+  applicationRegistered = true;
 
 // ── Rutas REST ────────────────────────────────────────────────
 app.use('/api/v1/auth',         require('./routes/auth'));
@@ -70,17 +123,14 @@ app.use('/api/v1/schedules',    require('./routes/schedules'));
 app.use('/api/v1/academic',     require('./routes/academic'));
 app.use('/api/v1/peer-eval',    require('./routes/peer-eval'));
 
-// ── One-time migrations ───────────────────────────────────────
-// Unify legacy 'maestra' role → 'teacher'
-require('./config/db').query(
-  "UPDATE users SET rol = 'teacher' WHERE rol = 'maestra'"
-).then(r => {
-  if (r.rowCount > 0) console.log(`[migration] Migrated ${r.rowCount} user(s) from rol='maestra' to 'teacher'`);
-}).catch(e => console.warn('[migration] maestra→teacher:', e.message));
-
 // ── Health check ──────────────────────────────────────────────
-app.get('/health', (req, res) => {
-  res.json({ ok: true, message: 'Aubank API funcionando', timestamp: new Date() });
+app.get('/health', async (req, res) => {
+  try {
+    await require('./config/db').query('SELECT 1');
+    res.json({ ok: true, service: 'educoins-api', status: 'healthy', timestamp: new Date() });
+  } catch {
+    res.status(503).json({ ok: false, service: 'educoins-api', status: 'unavailable' });
+  }
 });
 
 // ── 404 ───────────────────────────────────────────────────────
@@ -91,28 +141,65 @@ app.use((req, res) => {
 // ── Error global ──────────────────────────────────────────────
 app.use((err, req, res, next) => {
   console.error('Error no manejado:', err);
+  if (err?.type === 'entity.too.large') {
+    return res.status(413).json({ ok: false, error: { code: 'PAYLOAD_TOO_LARGE', message: 'El contenido enviado es demasiado grande' } });
+  }
+  if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
+    return res.status(400).json({ ok: false, error: { code: 'INVALID_JSON', message: 'El cuerpo de la solicitud no es JSON válido' } });
+  }
   res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: 'Error interno del servidor' } });
 });
-
-// ── Fix one-time: simetrizar friendships asimétricos (datos viejos) ──────────
-require('./config/db').query(`
-  UPDATE friendships
-  SET removed_by_requester = TRUE, removed_by_addressee = TRUE
-  WHERE (removed_by_requester = TRUE AND removed_by_addressee = FALSE)
-     OR (removed_by_requester = FALSE AND removed_by_addressee = TRUE)
-`).catch(e => console.error('[startup] friendship symmetry fix failed:', e));
-
-// ── Migración: ampliar CHECK constraint de users.rol para incluir parent/staff ─
-require('./config/db').query(`
-  ALTER TABLE users
-    DROP CONSTRAINT IF EXISTS users_rol_check,
-    ADD CONSTRAINT users_rol_check
-      CHECK (rol IN ('student','teacher','admin','parent','staff'))
-`).catch(e => console.error('[startup] users_rol_check migration:', e.message));
+}
 
 // ── Iniciar servidor ──────────────────────────────────────────
-server.listen(PORT, () => {
-  console.log(`Aubank API corriendo en http://localhost:${PORT}`);
-  console.log(`   WebSocket activo en ws://localhost:${PORT}`);
-  console.log(`   Health check: http://localhost:${PORT}/health`);
-});
+server.requestTimeout = 65_000;
+server.headersTimeout = 70_000;
+server.keepAliveTimeout = 5_000;
+let p2pExpiryTimer;
+let taxTimer;
+
+async function startServer() {
+  await runCoreMigrations();
+  registerApplication();
+  await expirePendingOrders().catch(error => console.error('Error venciendo órdenes P2P:', error.message));
+  await processDueTaxes().catch(error => console.error('Error procesando impuestos:', error.message));
+  return server.listen(PORT, () => {
+    console.log(`EduCoins API corriendo en http://localhost:${PORT}`);
+    console.log(`   WebSocket activo en ws://localhost:${PORT}`);
+    console.log(`   Health check: http://localhost:${PORT}/health`);
+    p2pExpiryTimer = setInterval(() => {
+      expirePendingOrders().catch(error => console.error('Error venciendo órdenes P2P:', error.message));
+    }, 60_000);
+    p2pExpiryTimer.unref();
+    taxTimer = setInterval(() => {
+      processDueTaxes().catch(error => console.error('Error procesando impuestos:', error.message));
+    }, 15 * 60_000);
+    taxTimer.unref();
+  });
+}
+
+if (require.main === module) {
+  startServer().catch(error => {
+    console.error('No se pudo iniciar EduCoins:', error);
+    process.exit(1);
+  });
+}
+
+let shuttingDown = false;
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  if (p2pExpiryTimer) clearInterval(p2pExpiryTimer);
+  if (taxTimer) clearInterval(taxTimer);
+  console.log(`${signal}: cerrando servidor de forma segura`);
+  io.close();
+  server.close(async () => {
+    await require('./config/db').close().catch(() => {});
+    process.exit(0);
+  });
+  setTimeout(() => process.exit(1), 10_000).unref();
+}
+process.once('SIGTERM', () => shutdown('SIGTERM'));
+process.once('SIGINT', () => shutdown('SIGINT'));
+
+module.exports = { app, server, startServer };

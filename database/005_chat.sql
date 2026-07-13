@@ -130,7 +130,7 @@ INSERT INTO messages (conversation_id, sender_id, texto)
 SELECT
   c.id,
   (SELECT id FROM users WHERE rol = 'admin' LIMIT 1),
-  'Bienvenidos al chat de Aubank! Este es el espacio de toda la escuela.'
+  '¡Bienvenidos al chat de EduCoins! Este es el espacio de toda la escuela.'
 FROM conversations c
 WHERE c.type = 'global'
   AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id = c.id);

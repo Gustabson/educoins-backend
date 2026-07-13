@@ -8,16 +8,23 @@ const auth    = require('../middleware/auth');
 const { getBalance, getAccountByUserId } = require('../services/balance');
 
 const router = express.Router();
+const DUMMY_PASSWORD_HASH = bcrypt.hashSync('educoins-invalid-password', 12);
 
 // ── POST /api/v1/auth/login ───────────────────────────────────
 router.post('/login', async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { email, password } = req.body || {};
 
-    if (!email || !password) {
+    if (typeof email !== 'string' || typeof password !== 'string' || !email.trim() || !password) {
       return res.status(400).json({
         ok: false,
         error: { code: 'MISSING_FIELDS', message: 'Email y contraseña son requeridos' }
+      });
+    }
+    if (email.length > 254 || password.length > 200 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+      return res.status(400).json({
+        ok: false,
+        error: { code: 'INVALID_CREDENTIALS', message: 'Email o contraseña incorrectos' }
       });
     }
 
@@ -28,6 +35,7 @@ router.post('/login', async (req, res) => {
     );
 
     if (rows.length === 0) {
+      await bcrypt.compare(password, DUMMY_PASSWORD_HASH);
       return res.status(401).json({
         ok: false,
         error: { code: 'INVALID_CREDENTIALS', message: 'Email o contraseña incorrectos' }
@@ -63,7 +71,7 @@ router.post('/login', async (req, res) => {
     const token = jwt.sign(
       { sub: user.id, rol: user.rol, account_id: accountId },
       JWT_SECRET,
-      { expiresIn: '24h' }
+      { algorithm: 'HS256', expiresIn: '24h' }
     );
 
     res.json({
@@ -93,7 +101,7 @@ router.post('/login', async (req, res) => {
 router.get('/me', auth, async (req, res) => {
   try {
     const { rows } = await db.query(
-      `SELECT id, email, nombre, apodo, alias, rol, skin, border, title,
+      `SELECT id, email, nombre, apodo, rol, skin, border, title,
               unlocked_skins, unlocked_borders, unlocked_titles, unlocked_avatar_bgs,
               total_earned, estado, active_titles, avatar_bg, permisos
        FROM users WHERE id = $1`,

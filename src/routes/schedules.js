@@ -12,6 +12,8 @@ const express = require('express');
 const router  = express.Router();
 const db      = require('../config/db');
 const auth    = require('../middleware/auth');
+const uuidParams = require('../middleware/uuid-params');
+uuidParams(router, 'id');
 
 // Auto-migrate — never drop, only create if absent
 db.query(`

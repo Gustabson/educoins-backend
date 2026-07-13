@@ -9,8 +9,11 @@ const router  = express.Router();
 const db      = require('../config/db');
 const auth    = require('../middleware/auth');
 const roles   = require('../middleware/roles');
-const { getAccountByUserId } = require('../services/balance');
+const { getAccountByUserId, assertSufficientBalance, lockAccountsForUpdate } = require('../services/balance');
 const { getIO } = require('../socket');
+
+const dateInArgentina = offsetMs => new Date(Date.now() + offsetMs)
+  .toLocaleDateString('sv-SE', { timeZone: 'America/Argentina/Buenos_Aires' });
 
 // ── GET /checkin/config ───────────────────────────────────────
 router.get('/config', auth, async (req, res) => {
@@ -26,6 +29,12 @@ router.get('/config', auth, async (req, res) => {
 router.patch('/config', auth, roles('admin'), async (req, res) => {
   try {
     const { base_reward, bonus_3days, bonus_7days, bonus_30days, activo } = req.body;
+    const amounts = [base_reward, bonus_3days, bonus_7days, bonus_30days]
+      .filter(value => value !== undefined && value !== null);
+    if (amounts.some(value => !Number.isSafeInteger(Number(value)) || Number(value) < 0 || Number(value) > 1000000) ||
+        (activo !== undefined && typeof activo !== 'boolean')) {
+      return res.status(400).json({ ok:false, error:{code:'INVALID_CONFIG'} });
+    }
     const { rows } = await db.query(`
       UPDATE checkin_config SET
         base_reward  = COALESCE($1, base_reward),
@@ -35,7 +44,7 @@ router.patch('/config', auth, roles('admin'), async (req, res) => {
         activo       = COALESCE($5, activo),
         updated_at   = NOW()
       RETURNING *
-    `, [base_reward, bonus_3days, bonus_7days, bonus_30days, activo]);
+    `, [base_reward ?? null, bonus_3days ?? null, bonus_7days ?? null, bonus_30days ?? null, activo ?? null]);
     res.json({ ok: true, data: rows[0] });
   } catch (err) {
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
@@ -45,7 +54,7 @@ router.patch('/config', auth, roles('admin'), async (req, res) => {
 // ── GET /checkin/me ───────────────────────────────────────────
 router.get('/me', auth, async (req, res) => {
   try {
-    const hoy = new Date().toISOString().slice(0,10);
+    const hoy = dateInArgentina(0);
     const { rows: hoyRow } = await db.query(
       'SELECT * FROM daily_checkins WHERE user_id=$1 AND fecha=$2', [req.user.id, hoy]
     );
@@ -77,8 +86,8 @@ router.get('/me', auth, async (req, res) => {
 router.post('/', auth, async (req, res) => {
   const client = await db.getClient();
   try {
-    const hoy  = new Date().toISOString().slice(0,10);
-    const ayer = new Date(Date.now() - 86400000).toISOString().slice(0,10);
+    const hoy  = dateInArgentina(0);
+    const ayer = dateInArgentina(-86400000);
 
     // Verificar si ya hizo check-in hoy
     const { rows: yaHizo } = await client.query(
@@ -118,6 +127,9 @@ router.post('/', auth, async (req, res) => {
       "SELECT id FROM accounts WHERE account_type='treasury' AND is_active=TRUE LIMIT 1"
     );
     const studentAcc = await getAccountByUserId(req.user.id, client);
+    if (!treasury.length) throw new Error('Cuenta de tesorería no configurada');
+    await lockAccountsForUpdate([treasury[0].id, studentAcc], client);
+    await assertSufficientBalance(treasury[0].id, Number(recompensa), client);
     const txId = require('uuid').v4();
     await client.query(`
       INSERT INTO transactions (id,type,description,initiated_by,metadata)
@@ -159,7 +171,11 @@ router.post('/', auth, async (req, res) => {
     }});
   } catch (err) {
     await client.query('ROLLBACK');
-    res.status(500).json({ ok: false, error: { code: err.code||'SERVER_ERROR', message: err.message } });
+    if (err.code === '23505') {
+      return res.status(409).json({ ok:false, error:{code:'ALREADY_DONE', message:'Ya hiciste check-in hoy'} });
+    }
+    const status = err.code === 'INSUFFICIENT_BALANCE' ? 409 : 500;
+    res.status(status).json({ ok: false, error: { code: err.code||'SERVER_ERROR', message: err.message } });
   } finally { client.release(); }
 });
 

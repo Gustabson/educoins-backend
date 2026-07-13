@@ -7,9 +7,11 @@ const { v4: uuidv4 } = require('uuid');
 const db     = require('../config/db');
 const auth   = require('../middleware/auth');
 const roles  = require('../middleware/roles');
+const uuidParams = require('../middleware/uuid-params');
 const ledger = require('../services/ledger');
 const { getIO } = require('../socket');
 const router = express.Router();
+uuidParams(router, 'id');
 
 // ── Startup migrations ──────────────────────────────────────────
 
@@ -760,8 +762,10 @@ router.post('/ranking/close', auth, roles('admin'), async (req, res) => {
     const { rows: paid } = await client.query(
       'SELECT id FROM coop_ranking_payouts WHERE periodo_label=$1 LIMIT 1', [periodoLabel]
     );
-    if (paid.length)
+    if (paid.length) {
+      await client.query('ROLLBACK');
       return res.status(422).json({ ok: false, error: { code: 'ALREADY_PAID', message: `Semana ${periodoLabel} ya fue pagada` } });
+    }
 
     // Build ranking
     const { rows: ranking } = await client.query(`
@@ -784,36 +788,36 @@ router.post('/ranking/close', auth, roles('admin'), async (req, res) => {
     const prizeMap = {};
     prizes.forEach(p => { prizeMap[p.posicion] = p.premio; });
 
-    await client.query('BEGIN');
     let count = 0;
+    const rewarded = [];
     for (let i = 0; i < ranking.length; i++) {
       const pos = i + 1;
       const premio = prizeMap[pos];
       if (!premio || premio <= 0) continue;
 
       const student = ranking[i];
-      try {
-        const txId = await ledger.reward({
+      const txId = await ledger.reward({
           teacherId: req.user.id,
           studentId: student.id,
           amount: premio,
           description: `Ranking cooperacion semana ${periodoLabel} — puesto #${pos}`,
           meta: { referenceType: 'coop_ranking', periodo: periodoLabel, posicion: pos },
-        });
-        await client.query(
-          'INSERT INTO coop_ranking_payouts (id, periodo_label, user_id, posicion, premio, transaction_id) VALUES ($1,$2,$3,$4,$5,$6)',
-          [uuidv4(), periodoLabel, student.id, pos, premio, txId]
-        );
-        notify(student.id, {
-          type: 'coop_ranking_reward',
-          amount: premio,
-          posicion: pos,
-          message: `🤝 Ranking de cooperacion: puesto #${pos} — +🪙${premio}`,
-        });
-        count++;
-      } catch (e) { /* skip if budget exceeded */ }
+          client,
+      });
+      await client.query(
+        'INSERT INTO coop_ranking_payouts (id, periodo_label, user_id, posicion, premio, transaction_id) VALUES ($1,$2,$3,$4,$5,$6)',
+        [uuidv4(), periodoLabel, student.id, pos, premio, txId]
+      );
+      rewarded.push({ userId: student.id, premio, pos });
+      count++;
     }
     await client.query('COMMIT');
+    for (const item of rewarded) {
+      notify(item.userId, {
+        type: 'coop_ranking_reward', amount: item.premio, posicion: item.pos,
+        message: `🤝 Ranking de cooperación: puesto #${item.pos} — +🪙${item.premio}`,
+      });
+    }
     res.json({ ok: true, data: { count, periodo: periodoLabel } });
   } catch (err) {
     await client.query('ROLLBACK').catch(()=>{});

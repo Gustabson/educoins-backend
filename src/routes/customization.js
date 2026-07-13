@@ -14,10 +14,13 @@
 const express = require('express');
 const router  = express.Router();
 const db      = require('../config/db');
+const uuidParams = require('../middleware/uuid-params');
+uuidParams(router, 'id');
 const auth    = require('../middleware/auth');
 const roles   = require('../middleware/roles');
-const { getAccountByUserId, assertSufficientBalance } = require('../services/balance');
+const { getAccountByUserId, assertSufficientBalance, lockAccountsForUpdate } = require('../services/balance');
 const audit   = require('../services/audit');
+const CUSTOM_ITEM_TYPES = ['theme','name_color','emoji_pack','title_effect','name_effect','avatar_frame','screen_mode','text_style'];
 
 // ── GET /custom/shop ──────────────────────────────────────────
 router.get('/shop', auth, async (req, res) => {
@@ -107,29 +110,35 @@ router.post('/buy', auth, async (req, res) => {
     const { item_id } = req.body;
     if (!item_id) return res.status(400).json({ ok: false, error: { code: 'MISSING_FIELD' } });
 
-    const { rows: item } = await db.query(
-      'SELECT * FROM shop_items_custom WHERE id=$1 AND activo=TRUE', [item_id]
+    await client.query('BEGIN');
+    const { rows: item } = await client.query(
+      'SELECT * FROM shop_items_custom WHERE id=$1 AND activo=TRUE FOR UPDATE', [item_id]
     );
-    if (!item.length) return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND', message: 'Item no encontrado' } });
+    if (!item.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND', message: 'Item no encontrado' } });
+    }
 
     // Verificar que no lo tiene ya
-    const { rows: alreadyOwned } = await db.query(
+    const { rows: alreadyOwned } = await client.query(
       'SELECT 1 FROM user_custom_items WHERE user_id=$1 AND item_id=$2', [req.user.id, item_id]
     );
-    if (alreadyOwned.length) return res.status(409).json({ ok: false, error: { code: 'ALREADY_OWNED', message: 'Ya tenés este item' } });
-
-    await client.query('BEGIN');
+    if (alreadyOwned.length) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ ok: false, error: { code: 'ALREADY_OWNED', message: 'Ya tenés este item' } });
+    }
 
     // Si tiene precio, descontar de la cuenta del usuario
     if (item[0].precio > 0) {
       const accId = await getAccountByUserId(req.user.id, client);
-      await assertSufficientBalance(accId, item[0].precio, client);
 
       // Buscar cuenta de tienda
       const { rows: store } = await client.query(
         "SELECT id FROM accounts WHERE account_type='store' AND is_active=TRUE LIMIT 1"
       );
       if (!store.length) throw new Error('Cuenta de tienda no configurada');
+      await lockAccountsForUpdate([accId, store[0].id], client);
+      await assertSufficientBalance(accId, Number(item[0].precio), client);
 
       const txId = require('uuid').v4();
       await client.query(`
@@ -165,8 +174,7 @@ router.post('/buy', auth, async (req, res) => {
 router.post('/equip', auth, async (req, res) => {
   try {
     const { tipo, item_id, custom_bg_color, custom_accent_color } = req.body;
-    const VALID_TIPOS = ['theme','name_color','emoji_pack','title_effect','name_effect','avatar_frame','screen_mode','text_style'];
-    if (!VALID_TIPOS.includes(tipo)) return res.status(400).json({ ok: false, error: { code: 'INVALID_TIPO' } });
+    if (!CUSTOM_ITEM_TYPES.includes(tipo)) return res.status(400).json({ ok: false, error: { code: 'INVALID_TIPO' } });
 
     if (item_id) {
       const { rows } = await db.query(
@@ -234,10 +242,12 @@ router.post('/equip', auth, async (req, res) => {
 router.post('/gift', auth, async (req, res) => {
   const client = await db.getClient();
   try {
-    const { to_user_id, item_id, coins, mensaje } = req.body;
+    const { to_user_id, item_id, mensaje } = req.body;
+    const coins = req.body.coins === undefined || req.body.coins === null ? 0 : Number(req.body.coins);
     if (!to_user_id) return res.status(400).json({ ok: false, error: { code: 'MISSING_FIELD' } });
     if (to_user_id === req.user.id) return res.status(400).json({ ok: false, error: { code: 'SELF_GIFT', message: 'No podés regalarte a vos mismo' } });
-    if (!item_id && (!coins || coins <= 0)) return res.status(400).json({ ok: false, error: { code: 'EMPTY_GIFT', message: 'El regalo debe tener un item o monedas' } });
+    if (!Number.isSafeInteger(coins) || coins < 0) return res.status(400).json({ ok: false, error: { code: 'INVALID_AMOUNT' } });
+    if (!item_id && coins <= 0) return res.status(400).json({ ok: false, error: { code: 'EMPTY_GIFT', message: 'El regalo debe tener un item o monedas' } });
 
     await client.query('BEGIN');
 
@@ -245,6 +255,7 @@ router.post('/gift', auth, async (req, res) => {
     if (coins && coins > 0) {
       const fromAcc = await getAccountByUserId(req.user.id, client);
       const toAcc   = await getAccountByUserId(to_user_id, client);
+      await lockAccountsForUpdate([fromAcc, toAcc], client);
       await assertSufficientBalance(fromAcc, coins, client);
       const txId = require('uuid').v4();
       await client.query(`INSERT INTO transactions (id,type,description,initiated_by,metadata) VALUES ($1,'transfer',$2,$3,$4)`,
@@ -343,10 +354,18 @@ router.get('/admin/items', auth, roles('admin'), async (req, res) => {
 router.post('/admin/items', auth, roles('admin'), async (req, res) => {
   try {
     const { tipo, nombre, descripcion, precio, config, preview, orden } = req.body;
+    if (!CUSTOM_ITEM_TYPES.includes(tipo) || typeof nombre !== 'string' || !nombre.trim() || nombre.trim().length > 120 ||
+        (descripcion != null && (typeof descripcion !== 'string' || descripcion.length > 2000)) ||
+        !Number.isSafeInteger(Number(precio ?? 0)) || Number(precio ?? 0) < 0 || Number(precio ?? 0) > 1000000 ||
+        (config != null && (typeof config !== 'object' || Array.isArray(config))) ||
+        (preview != null && (typeof preview !== 'string' || preview.length > 750000)) ||
+        !Number.isSafeInteger(Number(orden ?? 0))) {
+      return res.status(400).json({ ok: false, error: { code: 'INVALID_ITEM', message: 'Revisá los datos del ítem' } });
+    }
     const { rows } = await db.query(`
       INSERT INTO shop_items_custom (tipo,nombre,descripcion,precio,config,preview,orden)
       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *
-    `, [tipo, nombre, descripcion||null, precio||0, config||{}, preview||null, orden||0]);
+    `, [tipo, nombre.trim(), descripcion?.trim()||null, Number(precio??0), config||{}, preview||null, Number(orden??0)]);
     res.status(201).json({ ok: true, data: rows[0] });
   } catch (err) {
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
@@ -383,8 +402,6 @@ router.patch('/admin/items/:id', auth, roles('admin'), async (req, res) => {
   }
 });
 
-module.exports = router;
-
 // ── POST /custom/save-mode ────────────────────────────────────
 // Guarda el modo de pantalla personalizado del alumno
 // Body: { config: { bg, card, nav, inputBg, isDark, ... } }
@@ -406,3 +423,5 @@ router.post('/save-mode', auth, async (req, res) => {
     res.status(500).json({ ok: false, error: { code: 'SERVER_ERROR', message: err.message } });
   }
 });
+
+module.exports = router;

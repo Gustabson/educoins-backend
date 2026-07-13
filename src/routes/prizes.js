@@ -3,6 +3,8 @@ const router  = require('express').Router();
 const db      = require('../config/db');
 const auth  = require('../middleware/auth');
 const roles = require('../middleware/roles');
+const uuidParams = require('../middleware/uuid-params');
+uuidParams(router, 'id');
 
 // ── Migrations ───────────────────────────────────────────────
 (async () => {

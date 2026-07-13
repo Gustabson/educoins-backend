@@ -3,7 +3,9 @@ const express = require('express');
 const db    = require('../config/db');
 const auth  = require('../middleware/auth');
 const roles = require('../middleware/roles');
+const uuidParams = require('../middleware/uuid-params');
 const router = express.Router();
+uuidParams(router, 'id', 'userId');
 
 // Equipar skin, border o título (ya desbloqueado)
 router.post('/equip', auth, roles('student'), async (req, res) => {

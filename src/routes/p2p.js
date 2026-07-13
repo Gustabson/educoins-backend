@@ -3,9 +3,16 @@ const router = require('express').Router();
 const db     = require('../config/db');
 const auth   = require('../middleware/auth');
 const roles  = require('../middleware/roles');
+const uuidParams = require('../middleware/uuid-params');
 const { v4: uuidv4 } = require('uuid');
+const {
+  assertSufficientBalance,
+  getEscrowAccountId,
+  lockAccountsForUpdate,
+} = require('../services/balance');
 
 const ORDER_TIMEOUT_MIN = 30; // minutos para pagar
+uuidParams(router, 'id');
 
 // ── Helpers ────────────────────────────────────────────────────
 async function getConfig() {
@@ -23,18 +30,36 @@ async function getUserAccount(userId, client) {
 async function getBalance(userId) {
   const { rows } = await db.query(
     `SELECT COALESCE(SUM(le.amount),0)::integer AS bal
-     FROM ledger_entries le
-     JOIN accounts a ON a.id=le.account_id
-     WHERE a.user_id=$1`, [userId]);
+       FROM ledger_entries le
+       JOIN accounts a ON a.id=le.account_id
+      WHERE a.user_id=$1`,
+    [userId]
+  );
   return rows[0]?.bal || 0;
 }
 
-async function getTreasury(client) {
-  const q = client || db;
-  const { rows } = await q.query(
-    `SELECT id FROM accounts WHERE account_type='treasury' LIMIT 1`);
-  return rows[0]?.id;
+async function getOfferEscrowAccount(offer, client) {
+  const { rows } = await client.query(
+    `SELECT le.account_id
+       FROM ledger_entries le
+       JOIN accounts a ON a.id=le.account_id
+      WHERE le.transaction_id=$1 AND le.amount > 0
+        AND a.account_type IN ('escrow','treasury')
+      ORDER BY CASE WHEN a.account_type='escrow' THEN 0 ELSE 1 END
+      LIMIT 1`,
+    [offer.escrow_tx_id]
+  );
+  if (!rows.length) {
+    const error = new Error('No se encontró la garantía de la oferta');
+    error.code = 'ESCROW_NOT_FOUND';
+    throw error;
+  }
+  return rows[0].account_id;
 }
+
+const positiveInteger = value => Number.isSafeInteger(Number(value)) && Number(value) > 0
+  ? Number(value)
+  : null;
 
 // ── GET /p2p/config ────────────────────────────────────────────
 router.get('/config', auth, async (req, res) => {
@@ -48,12 +73,21 @@ router.get('/config', auth, async (req, res) => {
 router.patch('/config', auth, roles('admin'), async (req, res) => {
   try {
     const { activo, min_amount, max_amount, order_timeout, fee_percent } = req.body;
+    const current = await getConfig();
+    const nextMin = min_amount === undefined ? Number(current.min_amount) : positiveInteger(min_amount);
+    const nextMax = max_amount === undefined ? Number(current.max_amount) : positiveInteger(max_amount);
+    const nextTimeout = order_timeout === undefined ? Number(current.order_timeout || ORDER_TIMEOUT_MIN) : positiveInteger(order_timeout);
+    const nextFee = fee_percent === undefined ? Number(current.fee_percent || 0) : Number(fee_percent);
+    if (!nextMin || !nextMax || nextMin > nextMax || !nextTimeout || nextTimeout > 1440 ||
+        !Number.isFinite(nextFee) || nextFee < 0 || nextFee > 25 ||
+        (activo !== undefined && typeof activo !== 'boolean')) {
+      return res.status(400).json({ ok:false, error:{code:'INVALID_CONFIG', message:'Configuración P2P inválida'} });
+    }
     await db.query(
       `UPDATE p2p_config SET
-        activo=COALESCE($1,activo), min_amount=COALESCE($2,min_amount),
-        max_amount=COALESCE($3,max_amount), order_timeout=COALESCE($4,order_timeout),
-        fee_percent=COALESCE($5,fee_percent), updated_at=NOW()`,
-      [activo??null, min_amount||null, max_amount||null, order_timeout||null, fee_percent??null]
+        activo=$1, min_amount=$2, max_amount=$3, order_timeout=$4,
+        fee_percent=$5, updated_at=NOW()`,
+      [activo === undefined ? current.activo : activo, nextMin, nextMax, nextTimeout, nextFee]
     );
     res.json({ ok:true, data: await getConfig() });
   } catch(e) { res.status(500).json({ ok:false, error:{code:'SERVER_ERROR',message:e.message} }); }
@@ -93,8 +127,18 @@ router.get('/my-offers', auth, async (req, res) => {
 
 // ── POST /p2p/offers — crear oferta ───────────────────────────
 router.post('/offers', auth, roles('student','teacher'), async (req, res) => {
-  const { amount, price_ars, min_order, max_order, payment_methods, instructions } = req.body;
-  if (!amount||!price_ars) return res.status(400).json({ ok:false, error:{code:'MISSING_FIELDS'} });
+  const amount = positiveInteger(req.body.amount);
+  const minOrder = positiveInteger(req.body.min_order ?? 1);
+  const maxOrder = positiveInteger(req.body.max_order ?? amount);
+  const priceArs = Number(req.body.price_ars);
+  const instructions = typeof req.body.instructions === 'string' ? req.body.instructions.trim().slice(0, 500) : null;
+  const paymentMethods = Array.isArray(req.body.payment_methods)
+    ? [...new Set(req.body.payment_methods.filter(v => typeof v === 'string').map(v => v.trim().slice(0, 40)).filter(Boolean))].slice(0, 5)
+    : ['transferencia','efectivo'];
+  if (!amount || !minOrder || !maxOrder || minOrder > maxOrder || maxOrder > amount ||
+      !Number.isFinite(priceArs) || priceArs <= 0 || priceArs > 1000000 || !paymentMethods.length) {
+    return res.status(400).json({ ok:false, error:{code:'INVALID_OFFER', message:'Los datos de la oferta no son válidos'} });
+  }
 
   const cfg = await getConfig();
   if (!cfg.activo) return res.status(403).json({ ok:false, error:{code:'P2P_DISABLED', message:'El exchange está desactivado'} });
@@ -109,20 +153,22 @@ router.post('/offers', auth, roles('student','teacher'), async (req, res) => {
     await client.query('BEGIN');
     // Bloquear monedas en escrow (transfer a cuenta escrow del sistema)
     const sellerAcc = await getUserAccount(req.user.id, client);
-    const treasury  = await getTreasury(client);
+    const escrowAcc = await getEscrowAccountId(client);
+    await lockAccountsForUpdate([sellerAcc, escrowAcc], client);
+    await assertSufficientBalance(sellerAcc, amount, client);
     const txId = uuidv4();
     await client.query(
       `INSERT INTO transactions (id,type,description,initiated_by) VALUES ($1,'escrow','P2P escrow - oferta publicada',$2)`,
       [txId, req.user.id]);
     await client.query(
       `INSERT INTO ledger_entries (transaction_id,account_id,amount) VALUES ($1,$2,$3),($1,$4,$5)`,
-      [txId, sellerAcc, -amount, treasury, amount]);
+      [txId, sellerAcc, -amount, escrowAcc, amount]);
 
     const { rows } = await client.query(
       `INSERT INTO p2p_offers (seller_id,amount,price_ars,min_order,max_order,payment_methods,instructions,escrow_tx_id)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-      [req.user.id, amount, price_ars, min_order||1, max_order||amount,
-       payment_methods||['transferencia','efectivo'], instructions||null, txId]);
+      [req.user.id, amount, priceArs, minOrder, maxOrder,
+       paymentMethods, instructions, txId]);
 
     await client.query('COMMIT');
     res.status(201).json({ ok:true, data: rows[0] });
@@ -137,7 +183,7 @@ router.patch('/offers/:id/pause', auth, async (req, res) => {
   try {
     const { rows } = await db.query(
       `UPDATE p2p_offers SET status=CASE WHEN status='active' THEN 'paused' ELSE 'active' END, updated_at=NOW()
-       WHERE id=$1 AND seller_id=$2 RETURNING *`,
+       WHERE id=$1 AND seller_id=$2 AND status IN ('active','paused') RETURNING *`,
       [req.params.id, req.user.id]);
     if (!rows.length) return res.status(404).json({ ok:false, error:{code:'NOT_FOUND'} });
     res.json({ ok:true, data: rows[0] });
@@ -150,21 +196,34 @@ router.delete('/offers/:id', auth, async (req, res) => {
   try {
     await client.query('BEGIN');
     const { rows: offer } = await client.query(
-      `SELECT * FROM p2p_offers WHERE id=$1 AND seller_id=$2`, [req.params.id, req.user.id]);
+      `SELECT * FROM p2p_offers WHERE id=$1 AND seller_id=$2 FOR UPDATE`, [req.params.id, req.user.id]);
     if (!offer.length) { await client.query('ROLLBACK'); return res.status(404).json({ ok:false }); }
     if (offer[0].status !== 'active' && offer[0].status !== 'paused')
       { await client.query('ROLLBACK'); return res.status(400).json({ ok:false, error:{code:'CANNOT_CANCEL'} }); }
 
+    const { rows: openOrders } = await client.query(
+      `SELECT 1 FROM p2p_orders
+        WHERE offer_id=$1 AND status IN ('pending_payment','payment_sent','disputed')
+        LIMIT 1`,
+      [offer[0].id]
+    );
+    if (openOrders.length) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ ok:false, error:{code:'OPEN_ORDERS', message:'No podés cancelar una oferta con operaciones pendientes'} });
+    }
+
     // Devolver escrow al vendedor
     const sellerAcc = await getUserAccount(req.user.id, client);
-    const treasury  = await getTreasury(client);
+    const escrowAcc = await getOfferEscrowAccount(offer[0], client);
+    await lockAccountsForUpdate([sellerAcc, escrowAcc], client);
+    await assertSufficientBalance(escrowAcc, Number(offer[0].amount), client);
     const txId = uuidv4();
     await client.query(
       `INSERT INTO transactions (id,type,description,initiated_by) VALUES ($1,'escrow_return','P2P escrow devuelto - oferta cancelada',$2)`,
       [txId, req.user.id]);
     await client.query(
       `INSERT INTO ledger_entries (transaction_id,account_id,amount) VALUES ($1,$2,$3),($1,$4,$5)`,
-      [txId, treasury, -offer[0].amount, sellerAcc, offer[0].amount]);
+      [txId, escrowAcc, -offer[0].amount, sellerAcc, offer[0].amount]);
 
     await client.query(`UPDATE p2p_offers SET status='cancelled', updated_at=NOW() WHERE id=$1`, [req.params.id]);
     await client.query('COMMIT');
@@ -176,10 +235,10 @@ router.delete('/offers/:id', auth, async (req, res) => {
 });
 
 // ── POST /p2p/offers/:id/order — crear orden (comprador acepta) ─
-router.post('/offers/:id/order', auth, async (req, res) => {
+router.post('/offers/:id/order', auth, roles('student','teacher'), async (req, res) => {
   // Castear a entero — llega como string desde el body JSON
-  const amount = parseInt(req.body.amount, 10);
-  if (!amount || amount < 1) return res.status(400).json({ ok:false, error:{code:'MISSING_AMOUNT'} });
+  const amount = positiveInteger(req.body.amount);
+  if (!amount) return res.status(400).json({ ok:false, error:{code:'INVALID_AMOUNT'} });
 
   const client = await db.getClient();
   try {
@@ -230,7 +289,9 @@ router.post('/offers/:id/order', auth, async (req, res) => {
         message:`Cantidad entre ${minOrder} y ${maxOrder} EduCoins`} });
     }
 
-    const deadline = new Date(Date.now() + ORDER_TIMEOUT_MIN * 60000);
+    const cfg = await getConfig();
+    const timeoutMinutes = positiveInteger(cfg.order_timeout) || ORDER_TIMEOUT_MIN;
+    const deadline = new Date(Date.now() + timeoutMinutes * 60000);
     const { rows } = await client.query(
       `INSERT INTO p2p_orders (offer_id,buyer_id,seller_id,amount,price_ars,total_ars,payment_deadline)
        VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
@@ -292,11 +353,17 @@ router.get('/orders', auth, async (req, res) => {
 // ── PATCH /p2p/orders/:id/payment-sent — comprador marcó pago ─
 router.patch('/orders/:id/payment-sent', auth, async (req, res) => {
   try {
-    const { comprobante_url } = req.body;
+    const comprobanteUrl = typeof req.body.comprobante_url === 'string'
+      ? req.body.comprobante_url.trim().slice(0, 1500)
+      : null;
+    if (comprobanteUrl && !/^https:\/\//i.test(comprobanteUrl)) {
+      return res.status(400).json({ ok:false, error:{code:'INVALID_RECEIPT_URL'} });
+    }
     const { rows } = await db.query(
       `UPDATE p2p_orders SET status='payment_sent', comprobante_url=$1, updated_at=NOW()
-       WHERE id=$2 AND buyer_id=$3 AND status='pending_payment' RETURNING *`,
-      [comprobante_url||null, req.params.id, req.user.id]);
+       WHERE id=$2 AND buyer_id=$3 AND status='pending_payment'
+         AND payment_deadline > NOW() RETURNING *`,
+      [comprobanteUrl, req.params.id, req.user.id]);
     if (!rows.length) return res.status(400).json({ ok:false, error:{code:'INVALID_STATE'} });
 
     // Notificar al vendedor en tiempo real
@@ -320,21 +387,27 @@ router.patch('/orders/:id/release', auth, async (req, res) => {
   try {
     await client.query('BEGIN');
     const { rows: order } = await client.query(
-      `SELECT * FROM p2p_orders WHERE id=$1 AND seller_id=$2 AND status='payment_sent' FOR UPDATE`,
+      `SELECT po.*, pf.escrow_tx_id
+         FROM p2p_orders po
+         JOIN p2p_offers pf ON pf.id=po.offer_id
+        WHERE po.id=$1 AND po.seller_id=$2 AND po.status='payment_sent'
+        FOR UPDATE OF po`,
       [req.params.id, req.user.id]);
     if (!order.length) { await client.query('ROLLBACK'); return res.status(400).json({ ok:false, error:{code:'INVALID_STATE'} }); }
     const o = order[0];
 
     // Transferir monedas del escrow al comprador
     const buyerAcc  = await getUserAccount(o.buyer_id, client);
-    const treasury  = await getTreasury(client);
+    const escrowAcc = await getOfferEscrowAccount(o, client);
+    await lockAccountsForUpdate([buyerAcc, escrowAcc], client);
+    await assertSufficientBalance(escrowAcc, Number(o.amount), client);
     const txId = uuidv4();
     await client.query(
       `INSERT INTO transactions (id,type,description,initiated_by) VALUES ($1,'p2p_release','P2P: monedas liberadas al comprador',$2)`,
       [txId, req.user.id]);
     await client.query(
       `INSERT INTO ledger_entries (transaction_id,account_id,amount) VALUES ($1,$2,$3),($1,$4,$5)`,
-      [txId, treasury, -o.amount, buyerAcc, o.amount]);
+      [txId, escrowAcc, -o.amount, buyerAcc, o.amount]);
     // Update buyer total_earned
     await client.query('UPDATE users SET total_earned=total_earned+$1 WHERE id=$2', [o.amount, o.buyer_id]);
 
@@ -365,12 +438,15 @@ router.patch('/orders/:id/release', auth, async (req, res) => {
 // ── PATCH /p2p/orders/:id/dispute — abrir disputa ─────────────
 router.patch('/orders/:id/dispute', auth, async (req, res) => {
   try {
-    const { reason } = req.body;
+    const reason = typeof req.body.reason === 'string' ? req.body.reason.trim().slice(0, 500) : '';
+    if (reason.length < 5) {
+      return res.status(400).json({ ok:false, error:{code:'INVALID_REASON', message:'Explicá brevemente el motivo de la disputa'} });
+    }
     const { rows } = await db.query(
       `UPDATE p2p_orders SET status='disputed', dispute_reason=$1, updated_at=NOW()
        WHERE id=$2 AND (buyer_id=$3 OR seller_id=$3)
        AND status IN ('payment_sent','pending_payment') RETURNING *`,
-      [reason||'Sin motivo especificado', req.params.id, req.user.id]);
+      [reason, req.params.id, req.user.id]);
     if (!rows.length) return res.status(400).json({ ok:false, error:{code:'INVALID_STATE'} });
 
     // Notificar a ambas partes y admins
@@ -399,23 +475,28 @@ router.patch('/orders/:id/resolve', auth, roles('admin','teacher'), async (req, 
   try {
     await client.query('BEGIN');
     const { rows: order } = await client.query(
-      `SELECT * FROM p2p_orders WHERE id=$1 AND status='disputed' FOR UPDATE`, [req.params.id]);
+      `SELECT po.*, pf.escrow_tx_id
+         FROM p2p_orders po
+         JOIN p2p_offers pf ON pf.id=po.offer_id
+        WHERE po.id=$1 AND po.status='disputed'
+        FOR UPDATE OF po`, [req.params.id]);
     if (!order.length) { await client.query('ROLLBACK'); return res.status(404).json({ ok:false }); }
     const o = order[0];
 
-    const treasury   = await getTreasury(client);
     const buyerAcc   = await getUserAccount(o.buyer_id, client);
     const sellerAcc  = await getUserAccount(o.seller_id, client);
+    const escrowAcc  = await getOfferEscrowAccount(o, client);
     const txId = uuidv4();
-    const recipientId   = winner === 'buyer' ? o.buyer_id : o.seller_id;
     const recipientAcc  = winner === 'buyer' ? buyerAcc : sellerAcc;
+    await lockAccountsForUpdate([escrowAcc, recipientAcc], client);
+    await assertSufficientBalance(escrowAcc, Number(o.amount), client);
 
     await client.query(
       `INSERT INTO transactions (id,type,description,initiated_by) VALUES ($1,'p2p_resolve','P2P disputa resuelta por moderador',$2)`,
       [txId, req.user.id]);
     await client.query(
       `INSERT INTO ledger_entries (transaction_id,account_id,amount) VALUES ($1,$2,$3),($1,$4,$5)`,
-      [txId, treasury, -o.amount, recipientAcc, o.amount]);
+      [txId, escrowAcc, -o.amount, recipientAcc, o.amount]);
     if (winner === 'buyer')
       await client.query('UPDATE users SET total_earned=total_earned+$1 WHERE id=$2', [o.amount, o.buyer_id]);
 
@@ -435,7 +516,11 @@ router.patch('/orders/:id/resolve', auth, roles('admin','teacher'), async (req, 
 // ── POST /p2p/orders/:id/rate — calificar ─────────────────────
 router.post('/orders/:id/rate', auth, async (req, res) => {
   try {
-    const { score, comment } = req.body;
+    const score = positiveInteger(req.body.score);
+    const comment = typeof req.body.comment === 'string' ? req.body.comment.trim().slice(0, 300) : null;
+    if (!score || score > 5) {
+      return res.status(400).json({ ok:false, error:{code:'INVALID_SCORE', message:'La calificación debe estar entre 1 y 5'} });
+    }
     const { rows: order } = await db.query(
       `SELECT * FROM p2p_orders WHERE id=$1 AND status='completed'
        AND (buyer_id=$2 OR seller_id=$2)`, [req.params.id, req.user.id]);
@@ -611,7 +696,7 @@ router.get('/orders/:id/detail', auth, roles('admin','teacher'), async (req, res
       LEFT JOIN users u ON u.id = a.user_id
       WHERE le.transaction_id = $1 OR le.transaction_id = $2
       ORDER BY le.created_at ASC
-    `, [rows[0].release_tx_id, rows[0].escrow_tx_id].filter(Boolean));
+    `, [rows[0].release_tx_id, rows[0].escrow_tx_id]);
 
     res.json({ ok:true, data: { order: rows[0], ledger_entries: entries } });
   } catch(e) {

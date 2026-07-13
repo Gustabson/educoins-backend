@@ -20,8 +20,11 @@ const router  = express.Router();
 const db      = require('../config/db');
 const auth    = require('../middleware/auth');
 const roles   = require('../middleware/roles');
+const uuidParams = require('../middleware/uuid-params');
+const { validate: isUuid } = require('uuid');
 
 const MSG_LIMIT = 50; // mensajes por pagina
+uuidParams(router, 'id', 'userId');
 
 // ── Funcion auxiliar: obtener o crear conversacion personal ───
 async function getOrCreatePersonalConv(userA, userB) {
@@ -60,7 +63,7 @@ async function getOrCreatePersonalConv(userA, userB) {
 
 // ── GET /chat/global/info ─────────────────────────────────────
 // Devuelve el conversation_id del chat global
-router.get('/global/info', auth, async (req, res) => {
+router.get('/global/info', auth, roles('student','teacher','admin'), async (req, res) => {
   try {
     const { rows } = await db.query(
       "SELECT id AS conversation_id FROM conversations WHERE type = 'global' LIMIT 1"
@@ -81,7 +84,7 @@ router.get('/global/info', auth, async (req, res) => {
 });
 
 // ── GET /chat/global/messages ─────────────────────────────────
-router.get('/global/messages', auth, async (req, res) => {
+router.get('/global/messages', auth, roles('student','teacher','admin'), async (req, res) => {
   try {
     const before = req.query.before || null; // cursor para paginacion
     const { rows } = await db.query(`
@@ -218,8 +221,24 @@ router.get('/classroom/messages', auth, async (req, res) => {
 router.get('/personal/:userId/messages', auth, async (req, res) => {
   try {
     const otherId = req.params.userId;
+    if (!isUuid(otherId) || otherId === req.user.id) {
+      return res.status(400).json({ ok: false, error: { code: 'INVALID_USER', message: 'Usuario inválido' } });
+    }
+    const { rowCount: canMessage } = await db.query(`
+      SELECT 1
+        FROM friendships f
+        JOIN users other_user
+          ON other_user.id=$2 AND other_user.activo=TRUE
+       WHERE ((f.requester_id=$1 AND f.addressee_id=$2)
+           OR (f.requester_id=$2 AND f.addressee_id=$1))
+         AND f.estado='accepted'
+         AND NOT f.removed_by_requester AND NOT f.removed_by_addressee
+       LIMIT 1`, [req.user.id, otherId]);
+    if (!canMessage) {
+      return res.status(403).json({ ok: false, error: { code: 'FRIENDSHIP_REQUIRED', message: 'Solo podés escribirle a contactos aceptados' } });
+    }
 
-    // Crear conversación si no existe — mensajear no requiere amistad
+    // Crear conversación solo entre contactos aceptados.
     const convId = await getOrCreatePersonalConv(req.user.id, otherId);
     const before = req.query.before || null;
 
@@ -337,8 +356,8 @@ router.get('/users/search', auth, async (req, res) => {
 router.post('/friends/request', auth, async (req, res) => {
   try {
     const { addressee_id } = req.body;
-    if (!addressee_id) {
-      return res.status(400).json({ ok: false, error: { code: 'INVALID_BODY', message: 'Falta addressee_id' } });
+    if (!isUuid(addressee_id)) {
+      return res.status(400).json({ ok: false, error: { code: 'INVALID_BODY', message: 'addressee_id inválido' } });
     }
     if (addressee_id === req.user.id) {
       return res.status(400).json({ ok: false, error: { code: 'SELF_FRIEND', message: 'No podes agregarte a vos mismo' } });
@@ -850,7 +869,7 @@ async function getOrCreateParentClassroomConv(classroomId) {
 }
 
 // GET /chat/parent-global/info
-router.get('/parent-global/info', auth, async (req, res) => {
+router.get('/parent-global/info', auth, roles('parent'), async (req, res) => {
   try {
     const convId = await getOrCreateParentGlobalConv();
     await db.query(
@@ -864,7 +883,7 @@ router.get('/parent-global/info', auth, async (req, res) => {
 });
 
 // GET /chat/parent-global/messages
-router.get('/parent-global/messages', auth, async (req, res) => {
+router.get('/parent-global/messages', auth, roles('parent'), async (req, res) => {
   try {
     const convId = await getOrCreateParentGlobalConv();
     await db.query(
@@ -893,7 +912,7 @@ router.get('/parent-global/messages', auth, async (req, res) => {
 });
 
 // GET /chat/parent-classroom/info — classroom de los hijos del padre
-router.get('/parent-classroom/info', auth, async (req, res) => {
+router.get('/parent-classroom/info', auth, roles('parent'), async (req, res) => {
   try {
     const { rows: cls } = await db.query(`
       SELECT DISTINCT cl.id, cl.nombre
@@ -916,7 +935,7 @@ router.get('/parent-classroom/info', auth, async (req, res) => {
 });
 
 // GET /chat/parent-classroom/messages
-router.get('/parent-classroom/messages', auth, async (req, res) => {
+router.get('/parent-classroom/messages', auth, roles('parent'), async (req, res) => {
   try {
     const { rows: cls } = await db.query(`
       SELECT DISTINCT cl.id
@@ -951,7 +970,7 @@ router.get('/parent-classroom/messages', auth, async (req, res) => {
 });
 
 // GET /chat/parent-users/search — buscar solo padres
-router.get('/parent-users/search', auth, async (req, res) => {
+router.get('/parent-users/search', auth, roles('parent'), async (req, res) => {
   try {
     const q = (req.query.q || '').trim();
     if (q.length < 2) return res.json({ ok: true, data: [] });
@@ -965,7 +984,7 @@ router.get('/parent-users/search', auth, async (req, res) => {
         AND NOT (f.removed_by_requester AND f.removed_by_addressee)
       WHERE u.id <> $1
         AND u.activo = TRUE
-        AND u.rol = 'padre'
+        AND u.rol = 'parent'
         AND (u.nombre ILIKE $2 OR u.apodo ILIKE $2)
       ORDER BY COALESCE(u.apodo, u.nombre)
       LIMIT 15

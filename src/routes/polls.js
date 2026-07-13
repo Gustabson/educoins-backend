@@ -4,7 +4,9 @@ const router     = express.Router();
 const db         = require('../config/db');
 const auth       = require('../middleware/auth');
 const roles      = require('../middleware/roles');
+const uuidParams = require('../middleware/uuid-params');
 const balanceSvc = require('../services/balance');
+uuidParams(router, 'id', 'cid');
 
 // ── Helper: tomar snapshot de la economía ─────────────────────
 async function takeSnapshot(scope, classroom_id) {
